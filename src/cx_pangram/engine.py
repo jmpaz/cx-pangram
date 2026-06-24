@@ -1,0 +1,144 @@
+"""EditLens inference: load an open-pangram checkpoint and score text for AI-edit extent.
+
+Decoding mirrors pangramlabs/EditLens (scripts/inference.py):
+
+    score = (softmax(logits) · arange(n_buckets)) / (n_buckets - 1)
+
+i.e. the expected bucket index normalized to [0, 1]; 0 = fully human, 1 = fully
+AI-generated, and intermediate values quantify the degree of AI editing applied to a
+human draft. Long inputs are windowed into chunks (EditLens was trained on 75-799 word
+texts at <=512 tokens); chunk scores are length-weighted into a document aggregate while
+the per-chunk vector is retained for annotation.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+from .preprocess import clean_text, count_words
+
+MODELS: dict[str, tuple[str, str]] = {
+    "roberta": ("pangram/editlens_roberta-large", "FacebookAI/roberta-large"),
+    "llama": ("pangram/editlens_Llama-3.2-3B", "meta-llama/Llama-3.2-3B"),
+}
+
+MAX_LENGTH = 512
+MIN_WORDS = 50
+CHUNK_WORDS = 350
+
+_BANDS = (
+    (0.10, "human"),
+    (0.40, "lightly edited"),
+    (0.70, "moderately edited"),
+    (0.90, "heavily edited"),
+)
+
+
+def band_for(score: float) -> str:
+    for hi, name in _BANDS:
+        if score < hi:
+            return name
+    return "fully AI"
+
+
+@dataclass
+class ChunkScore:
+    index: int
+    score: float
+    bucket: int
+    band: str
+    n_words: int
+    probs: list[float]
+    preview: str
+
+
+@dataclass
+class Detection:
+    score: float
+    band: str
+    bucket: int
+    n_words: int
+    n_chunks: int
+    reliable: bool
+    model: str
+    most_ai_chunk: int | None
+    chunks: list[ChunkScore]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+class EditLens:
+    def __init__(self, model: str = "roberta", device: str | None = None):
+        if model == "llama":
+            raise NotImplementedError(
+                "llama backbone (gated base + qlora NormedLinear head) not yet wired; "
+                "use model='roberta'"
+            )
+        checkpoint, base = MODELS.get(model, (model, MODELS["roberta"][1]))
+        self.model_name = model
+        self.checkpoint = checkpoint
+        self.tokenizer = AutoTokenizer.from_pretrained(base)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.net = AutoModelForSequenceClassification.from_pretrained(checkpoint)
+        self.net.eval()
+        self.n_buckets = self.net.config.num_labels
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.net.to(self.device)
+
+    @torch.no_grad()
+    def _score(self, texts: list[str]) -> tuple[list[float], list[int], list[list[float]]]:
+        enc = self.tokenizer(
+            texts,
+            truncation=True,
+            max_length=MAX_LENGTH,
+            padding=True,
+            return_tensors="pt",
+        ).to(self.device)
+        logits = self.net(**enc).logits.float()
+        probs = torch.softmax(logits, dim=-1)
+        labels = torch.arange(self.n_buckets, device=probs.device, dtype=probs.dtype)
+        scores = (probs * labels).sum(-1) / (self.n_buckets - 1)
+        return scores.tolist(), probs.argmax(-1).tolist(), probs.tolist()
+
+    def detect(self, text: str) -> Detection:
+        cleaned = clean_text(text)
+        words = cleaned.split()
+        n_words = count_words(cleaned)
+        if not words:
+            return Detection(0.0, band_for(0.0), 0, 0, 0, False, self.model_name, None, [])
+
+        windows = [
+            " ".join(words[i : i + CHUNK_WORDS]) for i in range(0, len(words), CHUNK_WORDS)
+        ]
+        scores, buckets, probs = self._score(windows)
+        chunks = [
+            ChunkScore(
+                index=i,
+                score=round(s, 4),
+                bucket=int(b),
+                band=band_for(s),
+                n_words=len(w.split()),
+                probs=[round(x, 4) for x in p],
+                preview=w[:160],
+            )
+            for i, (w, s, b, p) in enumerate(zip(windows, scores, buckets, probs))
+        ]
+        total = sum(c.n_words for c in chunks) or 1
+        agg = sum(c.score * c.n_words for c in chunks) / total
+        most_ai = max(chunks, key=lambda c: c.score).index
+        return Detection(
+            score=round(agg, 4),
+            band=band_for(agg),
+            bucket=round(agg * (self.n_buckets - 1)),
+            n_words=n_words,
+            n_chunks=len(chunks),
+            reliable=n_words >= MIN_WORDS,
+            model=self.model_name,
+            most_ai_chunk=most_ai,
+            chunks=chunks,
+        )
