@@ -16,18 +16,57 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 import torch
+from huggingface_hub import hf_hub_download
+from safetensors import safe_open
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from .preprocess import clean_text, count_words
 
 MODELS: dict[str, tuple[str, str]] = {
     "roberta": ("pangram/editlens_roberta-large", "FacebookAI/roberta-large"),
-    "llama": ("pangram/editlens_Llama-3.2-3B", "meta-llama/Llama-3.2-3B"),
+    "llama": ("pangram/editlens_Llama-3.2-3B", "unsloth/Llama-3.2-3B"),
 }
 
 MAX_LENGTH = 512
+LLAMA_MAX_LENGTH = 1024
 MIN_WORDS = 50
 CHUNK_WORDS = 350
+
+
+class NormedLinear(torch.nn.Module):
+    """LayerNorm + bias-free Linear; EditLens's classification head on causal backbones.
+
+    Ported verbatim from pangramlabs/EditLens (train.py). The Llama adapter saves this
+    head via LoRA `modules_to_save`, so the architecture must match before loading.
+    """
+
+    def __init__(self, hidden_size, num_labels, device=None, dtype=None):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(hidden_size, device=device, dtype=dtype)
+        self.linear = torch.nn.Linear(
+            hidden_size, num_labels, bias=False, device=device, dtype=dtype
+        )
+
+    def forward(self, x):
+        return self.linear(self.norm(x))
+
+
+def _is_qlora(checkpoint: str) -> bool:
+    try:
+        hf_hub_download(checkpoint, "adapter_config.json")
+        return True
+    except Exception:
+        return False
+
+
+def _qlora_n_buckets(checkpoint: str) -> int:
+    path = hf_hub_download(checkpoint, "adapter_model.safetensors")
+    with safe_open(path, framework="pt") as f:
+        for key in f.keys():
+            if "score" in key and "linear.weight" in key:
+                return f.get_slice(key).get_shape()[0]
+    raise ValueError(f"could not infer n_buckets from adapter at {checkpoint}")
+
 
 _BANDS = (
     (0.10, "human"),
@@ -72,30 +111,65 @@ class Detection:
 
 
 class EditLens:
-    def __init__(self, model: str = "roberta", device: str | None = None):
-        if model == "llama":
-            raise NotImplementedError(
-                "llama backbone (gated base + qlora NormedLinear head) not yet wired; "
-                "use model='roberta'"
-            )
-        checkpoint, base = MODELS.get(model, (model, MODELS["roberta"][1]))
+    def __init__(
+        self, model: str = "roberta", device: str | None = None, base: str | None = None
+    ):
+        checkpoint, default_base = MODELS.get(model, (model, MODELS["roberta"][1]))
+        base = base or default_base
         self.model_name = model
         self.checkpoint = checkpoint
         self.tokenizer = AutoTokenizer.from_pretrained(base)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.net = AutoModelForSequenceClassification.from_pretrained(checkpoint)
+
+        if _is_qlora(checkpoint):
+            self.net, self.device = self._load_qlora(checkpoint, base)
+            self.tokenizer.padding_side = "left"
+            self.max_length = LLAMA_MAX_LENGTH
+        else:
+            self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+            self.net = AutoModelForSequenceClassification.from_pretrained(checkpoint)
+            self.net.to(self.device)
+            self.max_length = MAX_LENGTH
+
         self.net.eval()
         self.n_buckets = self.net.config.num_labels
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.net.to(self.device)
+
+    def _load_qlora(self, checkpoint: str, base: str):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "llama backbone needs CUDA (4-bit quantization); none found"
+            )
+        from peft import PeftModel
+        from transformers import BitsAndBytesConfig
+
+        n_buckets = _qlora_n_buckets(checkpoint)
+        quant = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        base_model = AutoModelForSequenceClassification.from_pretrained(
+            base, num_labels=n_buckets, quantization_config=quant, device_map={"": 0}
+        )
+        base_model.config.pad_token_id = self.tokenizer.pad_token_id
+        if isinstance(getattr(base_model, "score", None), torch.nn.Linear):
+            hidden = base_model.config.hidden_size
+            dev = next(base_model.parameters()).device
+            base_model.score = NormedLinear(
+                hidden, n_buckets, device=dev, dtype=torch.bfloat16
+            )
+        net = PeftModel.from_pretrained(base_model, checkpoint)
+        return net, next(net.parameters()).device
 
     @torch.no_grad()
-    def _score(self, texts: list[str]) -> tuple[list[float], list[int], list[list[float]]]:
+    def _score(
+        self, texts: list[str]
+    ) -> tuple[list[float], list[int], list[list[float]]]:
         enc = self.tokenizer(
             texts,
             truncation=True,
-            max_length=MAX_LENGTH,
+            max_length=self.max_length,
             padding=True,
             return_tensors="pt",
         ).to(self.device)
@@ -110,10 +184,13 @@ class EditLens:
         words = cleaned.split()
         n_words = count_words(cleaned)
         if not words:
-            return Detection(0.0, band_for(0.0), 0, 0, 0, False, self.model_name, None, [])
+            return Detection(
+                0.0, band_for(0.0), 0, 0, 0, False, self.model_name, None, []
+            )
 
         windows = [
-            " ".join(words[i : i + CHUNK_WORDS]) for i in range(0, len(words), CHUNK_WORDS)
+            " ".join(words[i : i + CHUNK_WORDS])
+            for i in range(0, len(words), CHUNK_WORDS)
         ]
         scores, buckets, probs = self._score(windows)
         chunks = [
