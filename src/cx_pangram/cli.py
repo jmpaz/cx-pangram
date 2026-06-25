@@ -1,21 +1,23 @@
-"""cx-pangram CLI: score text for AI-edit extent with a local EditLens model."""
+"""cx-pangram CLI: ref-aware AI-edit scoring backed by a local EditLens model.
+
+Positional ``TARGET``s are resolved through contextualize and scored as refs.
+Raw text is scored directly by the engine, so ``cx-pangram --text ...`` works
+without contextualize installed.
+"""
 
 from __future__ import annotations
 
-import json
-import shutil
-import subprocess
 import sys
-from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
-from .engine import MIN_WORDS, EditLens
-
-app = typer.Typer(add_completion=False, help="Local EditLens AI-edit detection (open-pangram).")
+app = typer.Typer(
+    add_completion=False,
+    help="Local EditLens AI-edit detection (open-pangram). "
+    "Pass refs as TARGETS, or raw text via --text / stdin.",
+)
 console = Console()
 
 
@@ -24,61 +26,15 @@ def _bar(score: float, width: int = 24) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _color(score: float) -> str:
-    if score < 0.10:
-        return "green"
-    if score < 0.40:
-        return "yellow"
-    if score < 0.70:
-        return "dark_orange"
-    return "red"
+def _render_raw(
+    content: str, *, model: str, base: Optional[str], device: Optional[str]
+) -> None:
+    from . import lens as lens_core
+    from .engine import MIN_WORDS, EditLens
 
-
-def _read_clipboard() -> str:
-    for cmd in (
-        ["wl-paste", "--no-newline"],
-        ["xclip", "-selection", "clipboard", "-o"],
-        ["pbpaste"],
-    ):
-        if shutil.which(cmd[0]):
-            try:
-                return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
-            except subprocess.CalledProcessError:
-                continue
-    raise typer.BadParameter("no clipboard tool found (wl-clipboard, xclip, or pbpaste)")
-
-
-@app.command()
-def main(
-    ctx: typer.Context,
-    text: Optional[str] = typer.Argument(None, help="Text to score (or use --file / --paste / stdin)"),
-    file: Optional[Path] = typer.Option(None, "--file", "-f", help="Read text from a file"),
-    model: str = typer.Option("roberta", "--model", "-m", help="roberta | llama"),
-    json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of a rendered view"),
-    device: Optional[str] = typer.Option(None, "--device", help="cuda | cpu | cuda:N"),
-    show_chunks: bool = typer.Option(False, "--chunks", help="Show per-segment scores"),
-    paste: bool = typer.Option(False, "--paste", "-p", help="Read text from the clipboard"),
-):
-    if file is not None:
-        content = file.read_text()
-    elif text is not None:
-        content = text
-    elif paste:
-        content = _read_clipboard()
-    elif not sys.stdin.isatty():
-        content = sys.stdin.read()
-    else:
-        typer.echo(ctx.get_help())
-        raise typer.Exit()
-
-    engine = EditLens(model=model, device=device)
+    engine = EditLens(model=model, device=device, base=base)
     det = engine.detect(content)
-
-    if json_out:
-        console.print_json(json.dumps(det.to_dict()))
-        raise typer.Exit()
-
-    color = _color(det.score)
+    color = lens_core._color(det.score)
     console.print(
         f"[bold]{det.score * 100:.0f}%[/bold] [{color}]{det.band}[/{color}]  "
         f"[dim]· {det.model} · {det.n_words} words · {det.n_chunks} chunk(s)[/dim]"
@@ -89,14 +45,81 @@ def main(
             f"[yellow]⚠ {det.n_words} words < {MIN_WORDS}; short-text scores are unreliable[/yellow]"
         )
 
-    if show_chunks and det.n_chunks > 1:
-        table = Table(show_header=True, header_style="bold")
-        table.add_column("#", justify="right")
-        table.add_column("score", justify="right")
-        table.add_column("band")
-        table.add_column("words", justify="right")
-        table.add_column("preview", overflow="ellipsis", max_width=58)
-        for c in det.chunks:
-            mark = "  ← most AI" if c.index == det.most_ai_chunk else ""
-            table.add_row(str(c.index), f"{c.score:.3f}", c.band + mark, str(c.n_words), c.preview)
-        console.print(table)
+
+@app.command()
+def main(
+    ctx: typer.Context,
+    targets: Optional[List[str]] = typer.Argument(
+        None, help="Refs to resolve and score (or use --text / stdin)"
+    ),
+    text: Optional[str] = typer.Option(
+        None, "--text", help="Score this raw text directly (skips ref resolution)"
+    ),
+    model: str = typer.Option("llama", "--model", "-m", help="llama | roberta"),
+    base: Optional[str] = typer.Option(
+        None,
+        "--base",
+        help="Override base model repo (e.g. an ungated Llama-3.2-3B mirror)",
+    ),
+    device: Optional[str] = typer.Option(None, "--device", help="cuda | cpu | cuda:N"),
+    split: bool = typer.Option(
+        False, "--split", help="Score multi-author prose instead of skipping it"
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit one JSON array of results"
+    ),
+    jsonl: bool = typer.Option(False, "--jsonl", help="Emit one JSON object per line"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show model load logs"),
+):
+    from . import lens as lens_core
+
+    if not verbose:
+        lens_core.quiet()
+
+    raw: Optional[str] = None
+    if text is not None:
+        raw = text
+    elif not targets and not sys.stdin.isatty():
+        raw = sys.stdin.read()
+
+    if raw is not None:
+        if jsonl:
+            typer.echo(
+                lens_core.format_jsonl(
+                    lens_core.score_text(raw, model=model, base=base, device=device)
+                )
+            )
+            raise typer.Exit()
+        if json_out:
+            typer.echo(
+                lens_core.format_json(
+                    lens_core.score_text(raw, model=model, base=base, device=device)
+                )
+            )
+            raise typer.Exit()
+        _render_raw(raw, model=model, base=base, device=device)
+        raise typer.Exit()
+
+    if not targets:
+        typer.echo(ctx.get_help())
+        raise typer.Exit()
+
+    try:
+        results = lens_core.score_refs(
+            targets, model=model, base=base, device=device, split=split
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.split(".")[0] == "contextualize":
+            raise typer.BadParameter(
+                "scoring refs needs contextualize; install with "
+                "`uv tool install cx-pangram[contextualize]` or pass --text for raw input"
+            ) from exc
+        raise
+
+    if jsonl:
+        typer.echo(lens_core.format_jsonl(results))
+        raise typer.Exit()
+    if json_out:
+        typer.echo(lens_core.format_json(results))
+        raise typer.Exit()
+    console.print(lens_core.format_human(results))
