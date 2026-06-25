@@ -121,7 +121,9 @@ def score_refs(
             "band": None,
             "bucket": None,
             "n_words": None,
+            "n_chunks": None,
             "reliable": None,
+            "model": None,
             "skipped": skip_reason is not None,
             "reason": skip_reason,
             "preview": None,
@@ -138,7 +140,9 @@ def score_refs(
             entry["band"] = det.band
             entry["bucket"] = det.bucket
             entry["n_words"] = det.n_words
+            entry["n_chunks"] = det.n_chunks
             entry["reliable"] = det.reliable
+            entry["model"] = det.model
             entry["preview"] = _preview(text)
 
     return results
@@ -167,7 +171,9 @@ def score_text(
             "band": det.band,
             "bucket": det.bucket,
             "n_words": det.n_words,
+            "n_chunks": det.n_chunks,
             "reliable": det.reliable,
+            "model": det.model,
             "skipped": False,
             "reason": None,
             "preview": _preview(content),
@@ -189,22 +195,55 @@ def _wire(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if k != "preview"}
 
 
+def _bar(score: float, width: int = 16) -> str:
+    filled = round(score * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def format_single(entry: dict) -> str:
+    """Detail view for one result: verdict line, short bar, blank, then metadata.
+
+    The score reads ``N% AI -> <band>`` so its direction is explicit: 0% is fully
+    human, 100% fully AI; the band names where that score sits.
+    """
+    if entry["skipped"]:
+        return f"[dim]— skip[/dim]  {entry['label']}  [dim]({entry['reason']})[/dim]"
+    score = entry["score"]
+    color = _color(score)
+    lines = [
+        f"[bold]{score * 100:.0f}%[/bold] AI → [{color}]{entry['band']}[/{color}]",
+        f"[{color}]{_bar(score)}[/{color}]",
+        "",
+        f"[dim]{entry['model']} · {entry['n_words']} words, {entry['n_chunks']} chunk(s)[/dim]",
+    ]
+    if not entry["reliable"]:
+        from .engine import MIN_WORDS
+
+        lines.append(
+            f"[yellow]⚠ {entry['n_words']} words < {MIN_WORDS}; short-text scores are unreliable[/yellow]"
+        )
+    return "\n".join(lines)
+
+
 def format_human(results: list[dict]) -> str:
-    """Colored one-line-per-ref summary; returns rich markup ready for a Console."""
+    """Band-led one-line-per-ref summary for scanning many refs; rich markup."""
+    bandw = max(
+        (len("skip" if e["skipped"] else (e["band"] or "")) for e in results),
+        default=0,
+    )
     lines: list[str] = []
     for entry in results:
         label = entry["label"]
         if entry["skipped"]:
-            lines.append(f"[dim]— skip[/dim]  {label}  [dim]({entry['reason']})[/dim]")
+            lines.append(
+                f"[dim]{'skip'.ljust(bandw)}[/dim]   {label}  [dim]({entry['reason']})[/dim]"
+            )
             continue
         score = entry["score"]
         color = _color(score)
-        preview = entry.get("preview") or ""
-        warn = "" if entry["reliable"] else f" [yellow]⚠{entry['n_words']}w[/yellow]"
+        band = (entry["band"] or "").ljust(bandw)
+        warn = "" if entry["reliable"] else " [yellow]⚠[/yellow]"
         lines.append(
-            (
-                f"[bold]{score * 100:.0f}%[/bold] [{color}]{entry['band']}[/{color}]{warn}  "
-                f"{label}  [dim]{preview}[/dim]"
-            ).rstrip()
+            f"[{color}]{band}[/{color}]  [bold]{score * 100:.0f}%[/bold]{warn}   {label}"
         )
     return "\n".join(lines)

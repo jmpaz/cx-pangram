@@ -21,31 +21,6 @@ app = typer.Typer(
 console = Console()
 
 
-def _bar(score: float, width: int = 24) -> str:
-    filled = round(score * width)
-    return "█" * filled + "░" * (width - filled)
-
-
-def _render_raw(
-    content: str, *, model: str, base: Optional[str], device: Optional[str]
-) -> None:
-    from . import lens as lens_core
-    from .engine import MIN_WORDS, EditLens
-
-    engine = EditLens(model=model, device=device, base=base)
-    det = engine.detect(content)
-    color = lens_core._color(det.score)
-    console.print(
-        f"[bold]{det.score * 100:.0f}%[/bold] [{color}]{det.band}[/{color}]  "
-        f"[dim]· {det.model} · {det.n_words} words · {det.n_chunks} chunk(s)[/dim]"
-    )
-    console.print(f"[{color}]{_bar(det.score)}[/{color}] [dim]{det.score:.3f}[/dim]")
-    if not det.reliable:
-        console.print(
-            f"[yellow]⚠ {det.n_words} words < {MIN_WORDS}; short-text scores are unreliable[/yellow]"
-        )
-
-
 @app.command()
 def main(
     ctx: typer.Context,
@@ -83,21 +58,14 @@ def main(
         raw = sys.stdin.read()
 
     if raw is not None:
+        results = lens_core.score_text(raw, model=model, base=base, device=device)
         if jsonl:
-            typer.echo(
-                lens_core.format_jsonl(
-                    lens_core.score_text(raw, model=model, base=base, device=device)
-                )
-            )
+            typer.echo(lens_core.format_jsonl(results))
             raise typer.Exit()
         if json_out:
-            typer.echo(
-                lens_core.format_json(
-                    lens_core.score_text(raw, model=model, base=base, device=device)
-                )
-            )
+            typer.echo(lens_core.format_json(results))
             raise typer.Exit()
-        _render_raw(raw, model=model, base=base, device=device)
+        console.print(lens_core.format_single(results[0]))
         raise typer.Exit()
 
     if not targets:
@@ -122,4 +90,7 @@ def main(
     if json_out:
         typer.echo(lens_core.format_json(results))
         raise typer.Exit()
-    console.print(lens_core.format_human(results))
+    if len(results) == 1:
+        console.print(lens_core.format_single(results[0]))
+    else:
+        console.print(lens_core.format_human(results))
