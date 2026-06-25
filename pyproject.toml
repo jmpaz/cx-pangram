@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "jmpaz", email = "30947643+jmpaz@users.noreply.github.com" }
 ]
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch>=2.4",
     "transformers>=4.44",
@@ -16,10 +16,6 @@ dependencies = [
     "rich>=13.7",
     "typer>=0.12",
     "huggingface-hub>=0.24",
-]
-
-[project.optional-dependencies]
-llama = [
     "peft>=0.11",
     "bitsandbytes>=0.43",
     "accelerate>=0.30",

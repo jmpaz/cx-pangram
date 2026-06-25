@@ -68,10 +68,14 @@ def _qlora_n_buckets(checkpoint: str) -> int:
     raise ValueError(f"could not infer n_buckets from adapter at {checkpoint}")
 
 
+# Calibrated for the llama-3.2-3B backbone (the default) on a human-vs-AI Are.na
+# corpus: lightly/moderately (0.55) sits just above the confirmed-human max (0.512)
+# so human prose never reads as moderately+. The >=0.55 bands are headroom only a
+# stronger signal (the unreleased 24B) trips; roberta over-flags and reads high here.
 _BANDS = (
-    (0.10, "human"),
-    (0.40, "lightly edited"),
-    (0.70, "moderately edited"),
+    (0.30, "human"),
+    (0.55, "lightly edited"),
+    (0.75, "moderately edited"),
     (0.90, "heavily edited"),
 )
 
@@ -112,7 +116,7 @@ class Detection:
 
 class EditLens:
     def __init__(
-        self, model: str = "roberta", device: str | None = None, base: str | None = None
+        self, model: str = "llama", device: str | None = None, base: str | None = None
     ):
         checkpoint, default_base = MODELS.get(model, (model, MODELS["roberta"][1]))
         base = base or default_base
@@ -208,13 +212,14 @@ class EditLens:
         total = sum(c.n_words for c in chunks) or 1
         agg = sum(c.score * c.n_words for c in chunks) / total
         most_ai = max(chunks, key=lambda c: c.score).index
+        reliable = n_words >= MIN_WORDS
         return Detection(
             score=round(agg, 4),
-            band=band_for(agg),
+            band=band_for(agg) if reliable else "unreliable",
             bucket=round(agg * (self.n_buckets - 1)),
             n_words=n_words,
             n_chunks=len(chunks),
-            reliable=n_words >= MIN_WORDS,
+            reliable=reliable,
             model=self.model_name,
             most_ai_chunk=most_ai,
             chunks=chunks,
