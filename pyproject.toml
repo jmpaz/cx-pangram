@@ -21,8 +21,21 @@ dependencies = [
     "accelerate>=0.30",
 ]
 
+[project.optional-dependencies]
+contextualize = [
+    "contextualize",
+    "cx-plugins",
+]
+
 [project.scripts]
 cx-pangram = "cx_pangram.cli:app"
+
+[project.entry-points."contextualize.plugins"]
+pangram = "cx_pangram.cx_plugin"
+
+[tool.uv.sources]
+contextualize = { git = "ssh://git@github.com/jmpaz/contextualize.git", branch = "main" }
+cx-plugins = { git = "ssh://git@github.com/jmpaz/cx-plugins.git", branch = "main" }
 
 [build-system]
 requires = ["uv_build>=0.11.4,<0.12.0"]
