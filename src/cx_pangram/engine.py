@@ -175,6 +175,7 @@ class EditLens:
         base = base or default_base
         self.checkpoint = checkpoint
         self.calibrated = self.model_name == "llama"
+        self.quantized = False
         self.tokenizer = AutoTokenizer.from_pretrained(base)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -199,6 +200,7 @@ class EditLens:
 
         n_buckets = _qlora_n_buckets(checkpoint)
         quantize = _resolve_quantize(self.device, self.quantize)
+        self.quantized = quantize
         load_kwargs: dict = {"num_labels": n_buckets}
         if quantize:
             from transformers import BitsAndBytesConfig
