@@ -41,6 +41,13 @@ contextualize = [
     "contextualize",
     "cx-plugins",
 ]
+eval = [
+    "datasets>=2.19",
+]
+dev = [
+    "pytest>=8.0",
+    "scipy>=1.11",
+]
 
 [project.urls]
 Repository = "https://github.com/jmpaz/cx-pangram"
