@@ -19,7 +19,7 @@
           shellHook = ''
             export UV_PYTHON="${python}/bin/python3"
             export LD_LIBRARY_PATH="${runtimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            uv sync --all-extras
+            uv sync --extra contextualize
             export VIRTUAL_ENV="$PWD/.venv"
             export PATH="$VIRTUAL_ENV/bin:$PATH"
           '';

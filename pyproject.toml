@@ -9,7 +9,7 @@ authors = [
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch>=2.4",
-    "transformers>=4.44",
+    "transformers>=5.0",
     "safetensors>=0.4",
     "emoji>=2.10",
     "numpy>=1.26",
@@ -17,11 +17,13 @@ dependencies = [
     "typer>=0.12",
     "huggingface-hub>=0.24",
     "peft>=0.11",
-    "bitsandbytes>=0.43",
     "accelerate>=0.30",
 ]
 
 [project.optional-dependencies]
+cuda = [
+    "bitsandbytes>=0.43",
+]
 contextualize = [
     "contextualize",
     "cx-plugins",
