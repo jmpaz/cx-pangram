@@ -92,10 +92,11 @@ def _preview(text: str, width: int = 60) -> str:
 def score_refs(
     targets,
     *,
-    model: str = "llama",
+    model: str | None = None,
     base: str | None = None,
     device: str | None = None,
     split: bool = False,
+    quantize: bool | None = None,
 ) -> list[dict]:
     """Resolve refs through contextualize and score their authored prose.
 
@@ -124,6 +125,7 @@ def score_refs(
             "n_chunks": None,
             "reliable": None,
             "model": None,
+            "calibrated": None,
             "skipped": skip_reason is not None,
             "reason": skip_reason,
             "preview": None,
@@ -133,7 +135,7 @@ def score_refs(
             pending.append((entry, text or ""))
 
     if pending:
-        engine = EditLens(model=model, device=device, base=base)
+        engine = EditLens(model=model, device=device, base=base, quantize=quantize)
         for entry, text in pending:
             det = engine.detect(text)
             entry["score"] = det.score
@@ -143,6 +145,7 @@ def score_refs(
             entry["n_chunks"] = det.n_chunks
             entry["reliable"] = det.reliable
             entry["model"] = det.model
+            entry["calibrated"] = det.calibrated
             entry["preview"] = _preview(text)
 
     return results
@@ -151,16 +154,17 @@ def score_refs(
 def score_text(
     content: str,
     *,
-    model: str = "llama",
+    model: str | None = None,
     base: str | None = None,
     device: str | None = None,
+    quantize: bool | None = None,
     label: str = "(text)",
 ) -> list[dict]:
     """Score a raw string with no ref resolution. Returns a single result dict in
     score_refs's wire shape so the same formatters apply to raw and resolved input."""
     from .engine import EditLens
 
-    engine = EditLens(model=model, device=device, base=base)
+    engine = EditLens(model=model, device=device, base=base, quantize=quantize)
     det = engine.detect(content)
     return [
         {
@@ -174,6 +178,7 @@ def score_text(
             "n_chunks": det.n_chunks,
             "reliable": det.reliable,
             "model": det.model,
+            "calibrated": det.calibrated,
             "skipped": False,
             "reason": None,
             "preview": _preview(content),
@@ -222,6 +227,10 @@ def format_single(entry: dict) -> str:
         lines.append(
             f"[yellow]⚠ {entry['n_words']} words < {MIN_WORDS}; short-text scores are unreliable[/yellow]"
         )
+    if entry.get("calibrated") is False:
+        lines.append(
+            "[dim]bands tuned for llama; roberta reads high, so treat as a rough gate[/dim]"
+        )
     return "\n".join(lines)
 
 
@@ -231,12 +240,16 @@ def format_human(results: list[dict]) -> str:
         (len("skip" if e["skipped"] else (e["band"] or "")) for e in results),
         default=0,
     )
+    uncalibrated = any(
+        not e["skipped"] and e.get("calibrated") is False for e in results
+    )
     lines: list[str] = []
     for entry in results:
         label = entry["label"]
+        mark = "~" if (not entry["skipped"] and entry.get("calibrated") is False) else " "
         if entry["skipped"]:
             lines.append(
-                f"[dim]{'skip'.ljust(bandw)}[/dim]   {label}  [dim]({entry['reason']})[/dim]"
+                f"{mark} [dim]{'skip'.ljust(bandw)}[/dim]   {label}  [dim]({entry['reason']})[/dim]"
             )
             continue
         score = entry["score"]
@@ -244,6 +257,10 @@ def format_human(results: list[dict]) -> str:
         band = (entry["band"] or "").ljust(bandw)
         warn = "" if entry["reliable"] else " [yellow]⚠[/yellow]"
         lines.append(
-            f"[{color}]{band}[/{color}]  [bold]{score * 100:.0f}%[/bold]{warn}   {label}"
+            f"{mark} [{color}]{band}[/{color}]  [bold]{score * 100:.0f}%[/bold]{warn}   {label}"
+        )
+    if uncalibrated:
+        lines.append(
+            "[dim]~ bands tuned for llama; roberta reads high, so treat as a rough gate[/dim]"
         )
     return "\n".join(lines)

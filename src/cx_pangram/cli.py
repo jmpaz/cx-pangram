@@ -30,13 +30,17 @@ def main(
     text: Optional[str] = typer.Option(
         None, "--text", help="Score this raw text directly (skips ref resolution)"
     ),
-    model: str = typer.Option("llama", "--model", "-m", help="llama | roberta"),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="auto | llama | roberta"
+    ),
     base: Optional[str] = typer.Option(
         None,
         "--base",
         help="Override base model repo (e.g. an ungated Llama-3.2-3B mirror)",
     ),
-    device: Optional[str] = typer.Option(None, "--device", help="cuda | cpu | cuda:N"),
+    device: Optional[str] = typer.Option(
+        None, "--device", help="cuda | mps | cpu | cuda:N"
+    ),
     split: bool = typer.Option(
         False, "--split", help="Score multi-author prose instead of skipping it"
     ),

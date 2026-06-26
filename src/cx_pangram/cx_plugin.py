@@ -17,7 +17,7 @@ def register_command(root: click.Group) -> None:
 
     @root.command(name="lens")
     @click.argument("targets", nargs=-1, required=True)
-    @click.option("--model", "-m", default="llama", help="llama | roberta")
+    @click.option("--model", "-m", default=None, help="auto | llama | roberta")
     @click.option(
         "--base", default=None, help="Override base model repo (e.g. an ungated mirror)"
     )
@@ -30,10 +30,10 @@ def register_command(root: click.Group) -> None:
         is_flag=True,
         help="Score multi-author prose instead of skipping it",
     )
-    @click.option("--device", default=None, help="cuda | cpu | cuda:N")
+    @click.option("--device", default=None, help="cuda | mps | cpu | cuda:N")
     def lens(
         targets: tuple[str, ...],
-        model: str,
+        model: str | None,
         base: str | None,
         json_out: bool,
         jsonl: bool,

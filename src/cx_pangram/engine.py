@@ -13,6 +13,7 @@ the per-chunk vector is retained for annotation.
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 
 import torch
@@ -33,13 +34,52 @@ MIN_WORDS = 50
 CHUNK_WORDS = 350
 
 
+def select_device(requested: str | None = None) -> str:
+    if requested:
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def default_model(device: str) -> str:
+    return "llama" if device.startswith(("cuda", "mps")) else "roberta"
+
+
+def _unquantized_dtype(device: str):
+    if device.startswith(("cuda", "mps")):
+        return torch.bfloat16
+    return torch.float32
+
+
+def _bnb_usable(device: str) -> bool:
+    if not device.startswith("cuda") or torch.version.hip is not None:
+        return False
+    try:
+        import bitsandbytes  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_quantize(device: str, want: bool | None) -> bool:
+    if want is None:
+        return _bnb_usable(device)
+    if want:
+        if not _bnb_usable(device):
+            raise RuntimeError(
+                f"quantize=True requested but 4-bit bitsandbytes is unavailable on "
+                f"{device}; needs a real CUDA device with cx-pangram[cuda] installed"
+            )
+        return True
+    return False
+
+
 class NormedLinear(torch.nn.Module):
-    """LayerNorm + bias-free Linear; EditLens's classification head on causal backbones.
-
-    Ported verbatim from pangramlabs/EditLens (train.py). The Llama adapter saves this
-    head via LoRA `modules_to_save`, so the architecture must match before loading.
-    """
-
     def __init__(self, hidden_size, num_labels, device=None, dtype=None):
         super().__init__()
         self.norm = torch.nn.LayerNorm(hidden_size, device=device, dtype=dtype)
@@ -68,10 +108,6 @@ def _qlora_n_buckets(checkpoint: str) -> int:
     raise ValueError(f"could not infer n_buckets from adapter at {checkpoint}")
 
 
-# Calibrated for the llama-3.2-3B backbone (the default) on a human-vs-AI Are.na
-# corpus: lightly/moderately (0.55) sits just above the confirmed-human max (0.512)
-# so human prose never reads as moderately+. The >=0.55 bands are headroom only a
-# stronger signal (the unreleased 24B) trips; roberta over-flags and reads high here.
 _BANDS = (
     (0.30, "human"),
     (0.55, "lightly edited"),
@@ -107,6 +143,7 @@ class Detection:
     n_chunks: int
     reliable: bool
     model: str
+    calibrated: bool
     most_ai_chunk: int | None
     chunks: list[ChunkScore]
 
@@ -116,55 +153,77 @@ class Detection:
 
 class EditLens:
     def __init__(
-        self, model: str = "llama", device: str | None = None, base: str | None = None
+        self,
+        model: str | None = None,
+        device: str | None = None,
+        base: str | None = None,
+        quantize: bool | None = None,
     ):
-        checkpoint, default_base = MODELS.get(model, (model, MODELS["roberta"][1]))
+        self.device = select_device(device)
+        if self.device.startswith("mps"):
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        self.quantize = quantize
+        self.model_name = model or default_model(self.device)
+        checkpoint, default_base = MODELS.get(
+            self.model_name, (self.model_name, MODELS["roberta"][1])
+        )
         base = base or default_base
-        self.model_name = model
         self.checkpoint = checkpoint
+        self.calibrated = self.model_name == "llama"
         self.tokenizer = AutoTokenizer.from_pretrained(base)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         if _is_qlora(checkpoint):
-            self.net, self.device = self._load_qlora(checkpoint, base)
+            self.net = self._load_adapter(checkpoint, base)
             self.tokenizer.padding_side = "left"
             self.max_length = LLAMA_MAX_LENGTH
         else:
-            self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-            self.net = AutoModelForSequenceClassification.from_pretrained(checkpoint)
+            self.net = AutoModelForSequenceClassification.from_pretrained(
+                checkpoint, dtype=_unquantized_dtype(self.device)
+            )
             self.net.to(self.device)
             self.max_length = MAX_LENGTH
 
         self.net.eval()
+        self.device = str(next(self.net.parameters()).device)
         self.n_buckets = self.net.config.num_labels
 
-    def _load_qlora(self, checkpoint: str, base: str):
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "llama backbone needs CUDA (4-bit quantization); none found"
-            )
+    def _load_adapter(self, checkpoint: str, base: str):
         from peft import PeftModel
-        from transformers import BitsAndBytesConfig
 
         n_buckets = _qlora_n_buckets(checkpoint)
-        quant = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
+        quantize = _resolve_quantize(self.device, self.quantize)
+        load_kwargs: dict = {"num_labels": n_buckets}
+        if quantize:
+            from transformers import BitsAndBytesConfig
+
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            head_dtype = torch.bfloat16
+            load_kwargs["dtype"] = head_dtype
+            load_kwargs["device_map"] = {"": torch.device(self.device).index or 0}
+        else:
+            head_dtype = _unquantized_dtype(self.device)
+            load_kwargs["dtype"] = head_dtype
+
         base_model = AutoModelForSequenceClassification.from_pretrained(
-            base, num_labels=n_buckets, quantization_config=quant, device_map={"": 0}
+            base, **load_kwargs
         )
         base_model.config.pad_token_id = self.tokenizer.pad_token_id
         if isinstance(getattr(base_model, "score", None), torch.nn.Linear):
             hidden = base_model.config.hidden_size
             dev = next(base_model.parameters()).device
             base_model.score = NormedLinear(
-                hidden, n_buckets, device=dev, dtype=torch.bfloat16
+                hidden, n_buckets, device=dev, dtype=head_dtype
             )
         net = PeftModel.from_pretrained(base_model, checkpoint)
-        return net, next(net.parameters()).device
+        if not quantize:
+            net = net.to(device=self.device, dtype=head_dtype)
+        return net
 
     @torch.no_grad()
     def _score(
@@ -178,6 +237,11 @@ class EditLens:
             return_tensors="pt",
         ).to(self.device)
         logits = self.net(**enc).logits.float()
+        if not torch.isfinite(logits).all():
+            raise RuntimeError(
+                f"non-finite logits from {self.model_name} on {self.device}; "
+                "likely a dtype/device mismatch"
+            )
         probs = torch.softmax(logits, dim=-1)
         labels = torch.arange(self.n_buckets, device=probs.device, dtype=probs.dtype)
         scores = (probs * labels).sum(-1) / (self.n_buckets - 1)
@@ -189,7 +253,16 @@ class EditLens:
         n_words = count_words(cleaned)
         if not words:
             return Detection(
-                0.0, band_for(0.0), 0, 0, 0, False, self.model_name, None, []
+                0.0,
+                band_for(0.0),
+                0,
+                0,
+                0,
+                False,
+                self.model_name,
+                self.calibrated,
+                None,
+                [],
             )
 
         windows = [
@@ -221,6 +294,7 @@ class EditLens:
             n_chunks=len(chunks),
             reliable=reliable,
             model=self.model_name,
+            calibrated=self.calibrated,
             most_ai_chunk=most_ai,
             chunks=chunks,
         )
