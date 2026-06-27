@@ -33,6 +33,11 @@ LLAMA_MAX_LENGTH = 1024
 MIN_WORDS = 50
 CHUNK_WORDS = 350
 
+DEFAULT_BATCH = 8
+MAX_BATCH = 64
+VRAM_BUDGET = 0.5
+ACT_SAFETY = 24  # rough per-window activation multiplier
+
 
 def select_device(requested: str | None = None) -> str:
     if requested:
@@ -229,6 +234,30 @@ class EditLens:
     def _score(
         self, texts: list[str]
     ) -> tuple[list[float], list[int], list[list[float]]]:
+        scores: list[float] = []
+        buckets: list[int] = []
+        probs: list[list[float]] = []
+        size = self._auto_batch(len(texts))
+        start = 0
+        while start < len(texts):
+            batch = texts[start : start + size]
+            try:
+                s, b, p = self._forward(batch)
+            except torch.cuda.OutOfMemoryError:
+                if size == 1:
+                    raise
+                torch.cuda.empty_cache()
+                size = max(1, size // 2)
+                continue
+            scores += s
+            buckets += b
+            probs += p
+            start += len(batch)
+        return scores, buckets, probs
+
+    def _forward(
+        self, texts: list[str]
+    ) -> tuple[list[float], list[int], list[list[float]]]:
         enc = self.tokenizer(
             texts,
             truncation=True,
@@ -246,6 +275,20 @@ class EditLens:
         labels = torch.arange(self.n_buckets, device=probs.device, dtype=probs.dtype)
         scores = (probs * labels).sum(-1) / (self.n_buckets - 1)
         return scores.tolist(), probs.argmax(-1).tolist(), probs.tolist()
+
+    def _auto_batch(self, n_windows: int) -> int:
+        """Up-front batch width: a slice of free VRAM on CUDA (backoff in _score
+        corrects overshoot), a fixed conservative width elsewhere."""
+        ceiling = min(n_windows, MAX_BATCH)
+        if not self.device.startswith("cuda"):
+            return min(ceiling, DEFAULT_BATCH)
+        free, _ = torch.cuda.mem_get_info(torch.device(self.device))
+        intermediate = getattr(
+            self.net.config, "intermediate_size", self.net.config.hidden_size * 4
+        )
+        per_window = self.max_length * intermediate * 2 * ACT_SAFETY
+        est = int(free * VRAM_BUDGET / per_window)
+        return max(1, min(ceiling, est))
 
     def detect(self, text: str) -> Detection:
         cleaned = clean_text(text)
