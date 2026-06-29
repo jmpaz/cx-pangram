@@ -67,6 +67,9 @@ def _generic_strip(content: str) -> str:
 
 def _detection_text(doc, split: bool) -> tuple[str | None, str | None]:
     """Resolve a doc to (text, skip_reason); exactly one is non-None."""
+    metadata = getattr(doc, "metadata", None) or {}
+    if metadata.get("transcript_error"):
+        return None, "transcription failed"
     prose = getattr(doc, "prose", None)
     if prose == "":
         return None, "no prose"
@@ -108,7 +111,7 @@ def score_refs(
 
     from .engine import EditLens
 
-    docs = list(resolve_refs(list(targets)))
+    docs = list(resolve_refs(list(targets), describe_media=False))
 
     pending: list[tuple[dict, str]] = []
     results: list[dict] = []
