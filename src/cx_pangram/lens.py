@@ -56,6 +56,9 @@ def _color(score: float) -> str:
     return "red"
 
 
+_UNCOLORED_BANDS = frozenset({"human", "unreliable"})
+
+
 def _generic_strip(content: str) -> str:
     """Best-effort prose extraction for refs that predate the prose contract."""
     text = _FRONTMATTER_RE.sub("", content or "")
@@ -203,25 +206,24 @@ def _wire(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if k != "preview"}
 
 
-def _bar(score: float, width: int = 16) -> str:
+def _bar(score: float, color: str, width: int = 16) -> str:
     filled = round(score * width)
-    return "█" * filled + "░" * (width - filled)
+    return f"[{color}]{'•' * filled}[/{color}][dim]{'·' * (width - filled)}[/dim]"
 
 
 def format_single(entry: dict) -> str:
-    """Detail view for one result: verdict line, short bar, blank, then metadata.
-
-    The score reads ``N% AI -> <band>`` so its direction is explicit: 0% is fully
-    human, 100% fully AI; the band names where that score sits.
-    """
+    """Detail view for one result."""
     if entry["skipped"]:
         return f"[dim]— skip[/dim]  {entry['label']}  [dim]({entry['reason']})[/dim]"
     score = entry["score"]
     color = _color(score)
+    band = entry["band"]
+    verdict = band if band in _UNCOLORED_BANDS else f"[{color}]{band}[/{color}]"
+    sep_indent = " " * (len(entry["model"]) + 1)
     lines = [
-        f"[bold]{score * 100:.0f}%[/bold] AI → [{color}]{entry['band']}[/{color}]",
-        f"[{color}]{_bar(score)}[/{color}]",
-        "",
+        f"[bold]{score * 100:.0f}% AI[/bold] →  {verdict}",
+        _bar(score, color),
+        f"[dim]{sep_indent}∵[/dim]",
         f"[dim]{entry['model']} · {entry['n_words']} words, {entry['n_chunks']} chunk(s)[/dim]",
     ]
     if not entry["reliable"]:
@@ -249,7 +251,9 @@ def format_human(results: list[dict]) -> str:
     lines: list[str] = []
     for entry in results:
         label = entry["label"]
-        mark = "~" if (not entry["skipped"] and entry.get("calibrated") is False) else " "
+        mark = (
+            "~" if (not entry["skipped"] and entry.get("calibrated") is False) else " "
+        )
         if entry["skipped"]:
             lines.append(
                 f"{mark} [dim]{'skip'.ljust(bandw)}[/dim]   {label}  [dim]({entry['reason']})[/dim]"

@@ -18,7 +18,7 @@ app = typer.Typer(
     help="Local EditLens AI-edit detection (open-pangram). "
     "Pass refs as TARGETS, or raw text via --text / stdin.",
 )
-console = Console()
+console = Console(highlight=False)
 
 
 @app.command()

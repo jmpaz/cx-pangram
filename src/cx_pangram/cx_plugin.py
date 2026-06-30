@@ -9,7 +9,7 @@ PLUGIN_API_VERSION = "1"
 PLUGIN_NAME = "pangram"
 PLUGIN_PRIORITY = 50
 
-console = Console()
+console = Console(highlight=False)
 
 
 def register_command(root: click.Group) -> None:
