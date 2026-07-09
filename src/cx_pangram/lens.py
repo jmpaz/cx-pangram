@@ -19,6 +19,9 @@ plugin discovery, and raw-text scoring paths stay free of heavy dependencies.
 from __future__ import annotations
 
 import re
+import sys
+from contextlib import contextmanager
+from pathlib import Path
 
 from .formatters import (
     format_human,
@@ -29,8 +32,10 @@ from .formatters import (
 
 __all__ = [
     "score_refs",
+    "score_targets",
     "score_text",
     "quiet",
+    "output_config",
     "format_human",
     "format_json",
     "format_jsonl",
@@ -60,6 +65,64 @@ def quiet() -> None:
     except Exception:
         pass
     warnings.filterwarnings("ignore")
+
+
+@contextmanager
+def output_config(*, verbose: bool = False, quiet_mode: bool = False):
+    """Scoped logging/progress policy that restores prior state on exit.
+
+    - transformers/hub *log noise* is off unless ``verbose`` — debug logs are a
+      separate concern from progress.
+    - HF *progress bars* stay on iff stderr is a TTY and not ``quiet_mode``, so
+      a first-run multi-GB checkpoint download is visible interactively but
+      never pollutes redirected output (bars write to stderr; stdout stays
+      clean for ``--json``).
+    - Warning suppression is scoped, not process-global, so a long-lived plugin
+      host's warning state is untouched outside the command body.
+    """
+    import warnings
+
+    from transformers.utils import logging as hf_logging
+
+    try:
+        from huggingface_hub.utils import (
+            are_progress_bars_disabled,
+            disable_progress_bars,
+            enable_progress_bars,
+        )
+    except ImportError:
+
+        def are_progress_bars_disabled() -> bool:
+            return False
+
+        def disable_progress_bars() -> None: ...
+
+        def enable_progress_bars() -> None: ...
+
+    show_bars = sys.stderr.isatty() and not quiet_mode
+    prev_verbosity = hf_logging.get_verbosity()
+    bars_were_disabled = are_progress_bars_disabled()
+    if verbose:
+        hf_logging.set_verbosity_info()
+    else:
+        hf_logging.set_verbosity_error()
+    if show_bars:
+        enable_progress_bars()
+        hf_logging.enable_progress_bar()
+    else:
+        disable_progress_bars()
+        hf_logging.disable_progress_bar()
+    with warnings.catch_warnings():
+        if not verbose:
+            warnings.simplefilter("ignore")
+        try:
+            yield
+        finally:
+            hf_logging.set_verbosity(prev_verbosity)
+            if bars_were_disabled:
+                disable_progress_bars()
+            else:
+                enable_progress_bars()
 
 
 def _generic_strip(content: str) -> str:
@@ -191,6 +254,71 @@ def score_refs(
             pending.append((entry, text or ""))
 
     if pending:
+        engine = get_engine(model=model, device=device, base=base, quantize=quantize)
+        detections = engine.detect_batch([text for _, text in pending])
+        for (entry, text), det in zip(pending, detections, strict=True):
+            entry.update(_det_wire(det))
+            entry["preview"] = _preview(text)
+
+    return results
+
+
+def score_targets(
+    targets,
+    *,
+    model: str | None = None,
+    base: str | None = None,
+    device: str | None = None,
+    split: bool = False,
+    quantize: bool | None = None,
+) -> list[dict]:
+    """Score a mixed target list in input order: ``-`` reads stdin, an existing
+    file path is read directly, anything else resolves as a contextualize ref.
+
+    Local files and stdin need no optional dependency — contextualize is only
+    imported when a true ref is present. Everything scores through one shared
+    engine in a single cross-document batched pass.
+    """
+    pending: list[tuple[dict, str]] = []
+    results: list[dict] = []
+
+    def add(label: str, source: str | None, text: str | None, reason: str | None):
+        entry = {
+            "ref": source,
+            "source": source,
+            "label": label,
+            **_EMPTY_ENTRY,
+            "skipped": reason is not None,
+            "reason": reason,
+            "preview": None,
+        }
+        results.append(entry)
+        if reason is None:
+            pending.append((entry, text or ""))
+
+    ref_targets = [
+        t for t in targets if t != "-" and not (len(t) < 4096 and Path(t).is_file())
+    ]
+    docs_by_target: dict[str, list] = {}
+    if ref_targets:
+        from contextualize import resolve_refs
+
+        for t in ref_targets:
+            docs_by_target[t] = list(resolve_refs([t], describe_media=False))
+
+    for t in targets:
+        if t == "-":
+            add("(stdin)", None, sys.stdin.read(), None)
+        elif t not in docs_by_target:
+            add(t, t, Path(t).read_text(errors="replace"), None)
+        else:
+            for doc in docs_by_target[t]:
+                text, skip_reason = _detection_text(doc, split)
+                add(_ref_label(doc), getattr(doc, "source", None), text, skip_reason)
+
+    if pending:
+        from .engine import get_engine
+
         engine = get_engine(model=model, device=device, base=base, quantize=quantize)
         detections = engine.detect_batch([text for _, text in pending])
         for (entry, text), det in zip(pending, detections, strict=True):

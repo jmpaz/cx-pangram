@@ -43,8 +43,12 @@ class _Report:
 
 @pytest.fixture
 def calls(monkeypatch):
+    from contextlib import nullcontext
+
     seen = {}
-    monkeypatch.setattr(lens, "quiet", lambda: None)
+    monkeypatch.setattr(
+        lens, "output_config", lambda *, verbose=False, quiet_mode=False: nullcontext()
+    )
 
     def score_text(content, **kw):
         seen["score_text"] = content
@@ -54,8 +58,13 @@ def calls(monkeypatch):
         seen["score_refs"] = list(targets)
         return [_wire(t, t) for t in targets]
 
+    def score_targets(targets, **kw):
+        seen["score_targets"] = list(targets)
+        return [_wire(t, t) for t in targets]
+
     monkeypatch.setattr(lens, "score_text", score_text)
     monkeypatch.setattr(lens, "score_refs", score_refs)
+    monkeypatch.setattr(lens, "score_targets", score_targets)
 
     def eval_dataset(**kw):
         seen["eval_dataset"] = kw
@@ -98,7 +107,7 @@ def test_text_flag_routes_to_score(calls):
 def test_positional_routes_to_score(calls):
     result = runner.invoke(cli.app, ["some-ref"])
     assert result.exit_code == 0
-    assert calls.get("score_refs") == ["some-ref"]
+    assert calls.get("score_targets") == ["some-ref"]
 
 
 def test_empty_invocation_routes_to_score(calls):
@@ -166,3 +175,63 @@ def test_markdown_routes_to_summary(calls, monkeypatch):
     result = runner.invoke(cli.app, ["eval", "--markdown"])
     assert result.exit_code == 0
     assert "| md table |" in result.output
+
+
+def test_version_flag_short_circuits(calls):
+    result = runner.invoke(cli.app, ["--version"])
+    assert result.exit_code == 0
+    assert result.output.startswith("cx-pangram ")
+    assert "score_targets" not in calls
+
+
+def test_missing_input_exits_two(calls, monkeypatch):
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+    result = runner.invoke(cli.app, ["score"])
+    assert result.exit_code == 2
+
+
+def test_file_target_scores_without_contextualize(calls, tmp_path):
+    f = tmp_path / "doc.txt"
+    f.write_text("plain file content")
+    result = runner.invoke(cli.app, [str(f)])
+    assert result.exit_code == 0
+    assert calls["score_targets"] == [str(f)]
+
+
+def test_fail_over_exit_codes(calls, monkeypatch):
+    high = _wire("hot", "hot")
+    high.update({"score": 0.9, "band": "fully AI", "reliable": True})
+
+    monkeypatch.setattr(lens, "score_targets", lambda targets, **kw: [high])
+    result = runner.invoke(cli.app, ["score", "x", "--fail-over", "0.5"])
+    assert result.exit_code == 3
+
+    low = _wire("cool", "cool")
+    monkeypatch.setattr(lens, "score_targets", lambda targets, **kw: [low])
+    result = runner.invoke(cli.app, ["score", "x", "--fail-over", "0.5"])
+    assert result.exit_code == 0
+
+    skipped = _wire("skip", "skip")
+    skipped.update({"skipped": True, "reason": "no prose", "reliable": None})
+    monkeypatch.setattr(lens, "score_targets", lambda targets, **kw: [skipped])
+    result = runner.invoke(cli.app, ["score", "x", "--fail-over", "0.5"])
+    assert result.exit_code == 4
+
+
+def test_diff_requires_two_targets(calls):
+    result = runner.invoke(cli.app, ["diff", "only-one"])
+    assert result.exit_code == 2
+    result = runner.invoke(cli.app, ["diff", "a", "b"])
+    assert result.exit_code == 0
+    assert calls["score_targets"] == ["a", "b"]
+
+
+def test_format_md_emits_table(calls):
+    result = runner.invoke(cli.app, ["score", "a", "-f", "md"])
+    assert result.exit_code == 0
+    assert result.output.startswith("| target |")
+
+
+def test_format_conflicts_rejected(calls):
+    result = runner.invoke(cli.app, ["score", "a", "-f", "md", "--json"])
+    assert result.exit_code == 2

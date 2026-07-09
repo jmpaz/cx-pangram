@@ -171,3 +171,89 @@ def test_markdown_summary_is_a_table():
     assert out.startswith("| model |")
     assert "Reproduce: `cx-pangram eval" in out
     assert "[/" not in out
+
+
+def _chunked_entry():
+    return {
+        "ref": None,
+        "source": None,
+        "label": "doc.txt",
+        "score": 0.62,
+        "band": "moderately edited",
+        "bucket": 2,
+        "n_words": 700,
+        "n_chunks": 2,
+        "reliable": True,
+        "confidence": 0.71,
+        "truncated": False,
+        "model": "llama",
+        "calibrated": True,
+        "most_ai_chunk": 1,
+        "skipped": False,
+        "reason": None,
+        "preview": "p",
+        "chunks": [
+            {
+                "index": 0,
+                "score": 0.2,
+                "band": "human",
+                "n_words": 350,
+                "word_start": 0,
+                "word_end": 350,
+                "confidence": 0.9,
+                "truncated": False,
+                "preview": "first chunk",
+            },
+            {
+                "index": 1,
+                "score": 0.9,
+                "band": "fully AI",
+                "n_words": 350,
+                "word_start": 350,
+                "word_end": 700,
+                "confidence": 0.8,
+                "truncated": True,
+                "preview": "second chunk",
+            },
+        ],
+    }
+
+
+def test_format_single_appends_heatmap_strip_for_multichunk():
+    from cx_pangram.formatters import format_single
+
+    out = format_single(_chunked_entry())
+    assert "peak #1" in out
+    assert "--chunks for detail" in out
+
+
+def test_format_chunks_lists_each_chunk():
+    from cx_pangram.formatters import format_chunks
+
+    out = format_chunks(_chunked_entry())
+    assert "#0" in out and "#1" in out
+    assert "first chunk" in out and "second chunk" in out
+    assert "⚠trunc" in out
+
+
+def test_format_diff_shows_delta_vs_first():
+    from cx_pangram.formatters import format_diff
+
+    a = _chunked_entry()
+    b = _chunked_entry()
+    b["label"], b["score"] = "other.txt", 0.82
+    out = format_diff([a, b])
+    assert "Δ+20" in out
+
+
+def test_format_markdown_is_plain_gfm():
+    from cx_pangram.formatters import format_markdown
+
+    a = _chunked_entry()
+    a["truncated"] = True
+    skip = {**_chunked_entry(), "skipped": True, "reason": "no prose"}
+    out = format_markdown([a, skip], deltas=True)
+    assert out.startswith("| target |")
+    assert "skipped: no prose" in out
+    assert "truncated" in out
+    assert "[/" not in out and "[bold]" not in out

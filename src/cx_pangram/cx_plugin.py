@@ -30,7 +30,10 @@ def register_command(root: click.Group) -> None:
         is_flag=True,
         help="Score multi-author prose instead of skipping it",
     )
+    @click.option("--chunks", is_flag=True, help="Show the per-chunk attribution table")
     @click.option("--device", default=None, help="cuda | mps | cpu | cuda:N")
+    @click.option("--quiet", "-q", is_flag=True, help="No progress output")
+    @click.option("--verbose", "-v", is_flag=True, help="Show model load / debug logs")
     def lens(
         targets: tuple[str, ...],
         model: str | None,
@@ -38,25 +41,33 @@ def register_command(root: click.Group) -> None:
         json_out: bool,
         jsonl: bool,
         split: bool,
+        chunks: bool,
         device: str | None,
+        quiet: bool,
+        verbose: bool,
     ) -> None:
         """Score refs' authored prose for AI-edit extent with a local EditLens."""
-        from . import ModelAccessError
+        from . import ModelAccessError, formatters
         from . import lens as lens_core
 
-        lens_core.quiet()
         try:
-            results = lens_core.score_refs(
-                targets, model=model, base=base, device=device, split=split
-            )
+            with lens_core.output_config(verbose=verbose, quiet_mode=quiet):
+                results = lens_core.score_refs(
+                    targets, model=model, base=base, device=device, split=split
+                )
         except ModelAccessError as exc:
             raise click.ClickException(str(exc)) from exc
 
         if jsonl:
-            click.echo(lens_core.format_jsonl(results))
+            click.echo(formatters.format_jsonl(results))
             return
         if json_out:
-            click.echo(lens_core.format_json(results))
+            click.echo(formatters.format_json(results))
             return
 
-        console.print(lens_core.format_human(results))
+        console.print(formatters.format_human(results))
+        if chunks:
+            for entry in results:
+                detail = formatters.format_chunks(entry)
+                if detail:
+                    console.print(f"[bold]{entry['label']}[/bold]\n{detail}")
