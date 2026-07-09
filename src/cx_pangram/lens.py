@@ -91,6 +91,59 @@ def _preview(text: str, width: int = 60) -> str:
     return flat[:width]
 
 
+_EMPTY_ENTRY = {
+    "score": None,
+    "band": None,
+    "bucket": None,
+    "n_words": None,
+    "n_chunks": None,
+    "reliable": None,
+    "confidence": None,
+    "truncated": None,
+    "model": None,
+    "calibrated": None,
+    "most_ai_chunk": None,
+    "chunks": None,
+}
+
+
+def _det_wire(det) -> dict:
+    """Detection → result-entry fields; the one mapping between the engine's
+    dataclass and the wire dicts every formatter consumes.
+
+    ``chunks`` carry cleaned-word coordinates (``word_start``/``word_end``),
+    not offsets into the original string — ``clean_text`` is lossy by design,
+    so previews plus cleaned-word spans are what the model actually saw.
+    """
+    return {
+        "score": det.score,
+        "band": det.band,
+        "bucket": det.bucket,
+        "n_words": det.n_words,
+        "n_chunks": det.n_chunks,
+        "reliable": det.reliable,
+        "confidence": det.confidence,
+        "truncated": det.truncated,
+        "model": det.model,
+        "calibrated": det.calibrated,
+        "most_ai_chunk": det.most_ai_chunk,
+        "chunks": [
+            {
+                "index": c.index,
+                "score": c.score,
+                "band": c.band,
+                "n_words": c.n_words,
+                "word_start": c.word_start,
+                "word_end": c.word_end,
+                "confidence": c.confidence,
+                "truncated": c.truncated,
+                "preview": c.preview[:120],
+            }
+            for c in det.chunks
+        ],
+    }
+
+
 def score_refs(
     targets,
     *,
@@ -102,13 +155,14 @@ def score_refs(
 ) -> list[dict]:
     """Resolve refs through contextualize and score their authored prose.
 
-    Returns one result dict per resolved doc with keys ref/source/label/score/
-    band/bucket/n_words/reliable/skipped/reason/preview. Skipped entries carry a
-    reason and null scores; scored entries carry a preview of the detection text.
+    Returns one result dict per resolved doc with keys ref/source/label plus the
+    :func:`_det_wire` fields. Skipped entries carry a reason and null scores;
+    scored entries carry a preview of the detection text. All pending docs score
+    through one shared engine in a single cross-document batched pass.
     """
     from contextualize import resolve_refs
 
-    from .engine import EditLens
+    from .engine import get_engine
 
     docs = list(resolve_refs(list(targets), describe_media=False))
 
@@ -120,14 +174,7 @@ def score_refs(
             "ref": getattr(doc, "source", None),
             "source": getattr(doc, "source", None),
             "label": _ref_label(doc),
-            "score": None,
-            "band": None,
-            "bucket": None,
-            "n_words": None,
-            "n_chunks": None,
-            "reliable": None,
-            "model": None,
-            "calibrated": None,
+            **_EMPTY_ENTRY,
             "skipped": skip_reason is not None,
             "reason": skip_reason,
             "preview": None,
@@ -137,17 +184,10 @@ def score_refs(
             pending.append((entry, text or ""))
 
     if pending:
-        engine = EditLens(model=model, device=device, base=base, quantize=quantize)
-        for entry, text in pending:
-            det = engine.detect(text)
-            entry["score"] = det.score
-            entry["band"] = det.band
-            entry["bucket"] = det.bucket
-            entry["n_words"] = det.n_words
-            entry["n_chunks"] = det.n_chunks
-            entry["reliable"] = det.reliable
-            entry["model"] = det.model
-            entry["calibrated"] = det.calibrated
+        engine = get_engine(model=model, device=device, base=base, quantize=quantize)
+        detections = engine.detect_batch([text for _, text in pending])
+        for (entry, text), det in zip(pending, detections, strict=True):
+            entry.update(_det_wire(det))
             entry["preview"] = _preview(text)
 
     return results
@@ -164,23 +204,16 @@ def score_text(
 ) -> list[dict]:
     """Score a raw string with no ref resolution. Returns a single result dict in
     score_refs's wire shape so the same formatters apply to raw and resolved input."""
-    from .engine import EditLens
+    from .engine import get_engine
 
-    engine = EditLens(model=model, device=device, base=base, quantize=quantize)
+    engine = get_engine(model=model, device=device, base=base, quantize=quantize)
     det = engine.detect(content)
     return [
         {
             "ref": None,
             "source": None,
             "label": label,
-            "score": det.score,
-            "band": det.band,
-            "bucket": det.bucket,
-            "n_words": det.n_words,
-            "n_chunks": det.n_chunks,
-            "reliable": det.reliable,
-            "model": det.model,
-            "calibrated": det.calibrated,
+            **_det_wire(det),
             "skipped": False,
             "reason": None,
             "preview": _preview(content),

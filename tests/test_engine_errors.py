@@ -63,3 +63,26 @@ def test_empty_text_reads_unreliable():
     assert det.band == "unreliable"
     assert det.reliable is False
     assert det.n_words == 0 and det.chunks == []
+
+
+def test_get_engine_normalizes_keys(monkeypatch):
+    import cx_pangram.engine as engine_mod
+
+    built = []
+
+    class _Fake:
+        def __init__(self, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(engine_mod, "EditLens", _Fake)
+    monkeypatch.setattr(engine_mod, "select_device", lambda d: d or "cpu")
+    monkeypatch.setattr(engine_mod, "_ENGINES", {})
+
+    a = engine_mod.get_engine()
+    b = engine_mod.get_engine(model="roberta", device="cpu")
+    assert a is b
+    assert len(built) == 1
+
+    c = engine_mod.get_engine(model="roberta", device="cpu", quantize=False)
+    assert c is not a
+    assert len(built) == 2

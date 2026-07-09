@@ -255,6 +255,34 @@ class _WindowScore:
     truncated: bool
 
 
+_ENGINES: dict[tuple, EditLens] = {}
+
+
+def get_engine(
+    model: str | None = None,
+    base: str | None = None,
+    device: str | None = None,
+    quantize: bool | None = None,
+) -> EditLens:
+    """Process-level engine cache keyed on normalized config.
+
+    Keys are normalized through :func:`select_device`/:func:`default_model` so
+    ``get_engine()`` and ``get_engine(model="llama")`` on a llama-default host
+    share one instance — a raw ``lru_cache`` would load the model twice. No
+    eviction: a host that alternates models keeps both resident (they coexist
+    on any GPU that fits llama); call ``_ENGINES.clear()`` to reclaim.
+    """
+    dev = select_device(device)
+    name = model or default_model(dev)
+    key = (name, base, dev, quantize)
+    engine = _ENGINES.get(key)
+    if engine is None:
+        engine = _ENGINES[key] = EditLens(
+            model=name, base=base, device=dev, quantize=quantize
+        )
+    return engine
+
+
 class EditLens:
     def __init__(
         self,
