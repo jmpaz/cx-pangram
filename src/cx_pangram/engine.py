@@ -107,7 +107,7 @@ def _is_qlora(checkpoint: str) -> bool:
 def _qlora_n_buckets(checkpoint: str) -> int:
     path = hf_hub_download(checkpoint, "adapter_model.safetensors")
     with safe_open(path, framework="pt") as f:
-        for key in f.keys():
+        for key in f.keys():  # noqa: SIM118 — safe_open handle is not a dict
             if "score" in key and "linear.weight" in key:
                 return f.get_slice(key).get_shape()[0]
     raise ValueError(f"could not infer n_buckets from adapter at {checkpoint}")
@@ -323,7 +323,9 @@ class EditLens:
                 probs=[round(x, 4) for x in p],
                 preview=w[:160],
             )
-            for i, (w, s, b, p) in enumerate(zip(windows, scores, buckets, probs))
+            for i, (w, s, b, p) in enumerate(
+                zip(windows, scores, buckets, probs, strict=True)
+            )
         ]
         total = sum(c.n_words for c in chunks) or 1
         agg = sum(c.score * c.n_words for c in chunks) / total

@@ -8,7 +8,6 @@ without contextualize installed.
 from __future__ import annotations
 
 import sys
-from typing import List, Optional
 
 import typer
 from rich.console import Console
@@ -24,21 +23,21 @@ console = Console(highlight=False)
 @app.command()
 def main(
     ctx: typer.Context,
-    targets: Optional[List[str]] = typer.Argument(
+    targets: list[str] | None = typer.Argument(
         None, help="Refs to resolve and score (or use --text / stdin)"
     ),
-    text: Optional[str] = typer.Option(
+    text: str | None = typer.Option(
         None, "--text", help="Score this raw text directly (skips ref resolution)"
     ),
-    model: Optional[str] = typer.Option(
+    model: str | None = typer.Option(
         None, "--model", "-m", help="auto | llama | roberta"
     ),
-    base: Optional[str] = typer.Option(
+    base: str | None = typer.Option(
         None,
         "--base",
         help="Override base model repo (e.g. an ungated Llama-3.2-3B mirror)",
     ),
-    device: Optional[str] = typer.Option(
+    device: str | None = typer.Option(
         None, "--device", help="cuda | mps | cpu | cuda:N"
     ),
     split: bool = typer.Option(
@@ -55,7 +54,7 @@ def main(
     if not verbose:
         lens_core.quiet()
 
-    raw: Optional[str] = None
+    raw: str | None = None
     if text is not None:
         raw = text
     elif not targets and not sys.stdin.isatty():
