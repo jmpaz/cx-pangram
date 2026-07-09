@@ -518,7 +518,7 @@ wheels = [
 [[package]]
 name = "contextualize"
 version = "0.1.0"
-source = { git = "ssh://git@github.com/jmpaz/contextualize.git?branch=main#2e2a38d93fa16390dc48281166978313f8e9facc" }
+source = { git = "https://github.com/jmpaz/contextualize.git?branch=main#85730e67085ed4b76013c1886966f0c0ce1826d7" }
 dependencies = [
     { name = "aider-chat" },
     { name = "anthropic" },
@@ -666,8 +666,8 @@ cuda = [
 requires-dist = [
     { name = "accelerate", specifier = ">=0.30" },
     { name = "bitsandbytes", marker = "extra == 'cuda'", specifier = ">=0.43" },
-    { name = "contextualize", marker = "extra == 'contextualize'", git = "ssh://git@github.com/jmpaz/contextualize.git?branch=main" },
-    { name = "cx-plugins", marker = "extra == 'contextualize'", git = "ssh://git@github.com/jmpaz/cx-plugins.git?branch=main" },
+    { name = "contextualize", marker = "extra == 'contextualize'", git = "https://github.com/jmpaz/contextualize.git?branch=main" },
+    { name = "cx-plugins", marker = "extra == 'contextualize'", git = "https://github.com/jmpaz/cx-plugins.git?branch=main" },
     { name = "emoji", specifier = ">=2.10" },
     { name = "huggingface-hub", specifier = ">=0.24" },
     { name = "numpy", specifier = ">=1.26" },
@@ -683,7 +683,7 @@ provides-extras = ["cuda", "contextualize"]
 [[package]]
 name = "cx-plugins"
 version = "0.1.0"
-source = { git = "ssh://git@github.com/jmpaz/cx-plugins.git?branch=main#dca305a00fd1eecc2e42900751418ed1221f7b50" }
+source = { git = "https://github.com/jmpaz/cx-plugins.git?branch=main#ebc1599d51f63b42efe6f4461fbda2c6363c55e4" }
 dependencies = [
     { name = "click" },
     { name = "cryptography" },
