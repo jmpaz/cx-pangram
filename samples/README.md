@@ -1,6 +1,10 @@
-# samples
+# Samples
 
-- `human_ishiguro.txt`: a fully human-written paragraph published in the [Pangram 3.0 technical post](https://www.pangram.com/blog/pangram-3-0-technical), used there as the source text for their AI-edit gradient demonstration.
-- `ishiguro_edit_{light,vivid,rewrite}.txt`: reproductions of that demonstration: the paragraph above, progressively AI-edited under the post's three prompts ("Clean this up, I'm trying to submit my paper to a literary journal", "Make the language more vibrant", "Rewrite this in the style of Ishiguro").Absolute values differ from the blog, which scores with an unreleased 24B model.
+This directory's four text files reproduce the editing gradient from Pangram's [3.0 technical post](https://www.pangram.com/blog/pangram-3-0-technical):
+- `human_ishiguro.txt` is the original human-written passage.
+- `ishiguro_edit_{light,vivid,rewrite}.txt` applies the post's three editing prompts in
+  increasing strength.
 
-The paper's actual evaluation set is the [`pangram/editlens_iclr`](https://huggingface.co/datasets/pangram/editlens_iclr) dataset.
+Local scores differ from the post, which used an unreleased 24B model.
+
+`cx-pangram eval` uses the paper's [`pangram/editlens_iclr`](https://huggingface.co/datasets/pangram/editlens_iclr) dataset instead.
