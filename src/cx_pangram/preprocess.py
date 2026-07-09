@@ -3,6 +3,11 @@
 EditLens was trained on text passed through `clean_text`; inference inputs must match
 or scores drift off-distribution. The lowercasing in particular is load-bearing: the
 released checkpoints expect lowercased input despite cased backbones.
+
+`remove_think_tag` splits without a maxsplit, so when `</think>` appears more than
+once, text between the first and second occurrence is kept and the remainder dropped.
+That is an upstream quirk preserved deliberately: patching it would move inference
+off the training distribution's preprocessing. Fidelity beats local correctness here.
 """
 
 import re
