@@ -148,3 +148,26 @@ def test_format_smoke_report_pass_fail():
         device="cpu",
     )
     assert "FAIL" in format_smoke_report(failed)
+
+
+def test_bands_artifact_schema():
+    import json
+
+    from cx_pangram.eval import bands_artifact
+
+    art = bands_artifact(_dataset_report())
+    assert art["kind"] == "cx-pangram-bands"
+    assert art["version"] == 1
+    assert len(art["cuts"]) == 4
+    assert all({"lt", "band", "pinned"} <= set(c) for c in art["cuts"])
+    assert art["provenance"]["dataset"] == "pangram/editlens_iclr"
+    json.dumps(art)
+
+
+def test_markdown_summary_is_a_table():
+    from cx_pangram.eval import format_markdown_summary
+
+    out = format_markdown_summary(_dataset_report())
+    assert out.startswith("| model |")
+    assert "Reproduce: `cx-pangram eval" in out
+    assert "[/" not in out

@@ -680,29 +680,113 @@ def propose_bands(
 
 
 @dataclass
-class QuantComparison:
+class RunComparison:
+    """Paired A/B read over identical samples: two engine configs, one diff."""
+
+    label_a: str
+    label_b: str
     model: str
     device: str
     n: int
     score_mae: float
     max_delta: float
     bucket_flip_rate: float
-    metrics_quant: DatasetMetrics
-    metrics_bf16: DatasetMetrics
-    scored_quant: list[Scored] = field(default_factory=list, repr=False)
-    scored_bf16: list[Scored] = field(default_factory=list, repr=False)
+    metrics_a: DatasetMetrics
+    metrics_b: DatasetMetrics
+    latency_a: dict = field(default_factory=dict)
+    latency_b: dict = field(default_factory=dict)
+    scored_a: list[Scored] = field(default_factory=list, repr=False)
+    scored_b: list[Scored] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict:
         return {
+            "label_a": self.label_a,
+            "label_b": self.label_b,
             "model": self.model,
             "device": self.device,
             "n": self.n,
             "score_mae": self.score_mae,
             "max_delta": self.max_delta,
             "bucket_flip_rate": self.bucket_flip_rate,
-            "metrics_quant": self.metrics_quant.to_dict(),
-            "metrics_bf16": self.metrics_bf16.to_dict(),
+            "metrics_a": self.metrics_a.to_dict(),
+            "metrics_b": self.metrics_b.to_dict(),
+            "latency_a": self.latency_a,
+            "latency_b": self.latency_b,
         }
+
+
+def _compare_runs(
+    samples: list[Sample],
+    kwargs_a: dict,
+    kwargs_b: dict,
+    labels: tuple[str, str],
+    *,
+    with_source: bool = False,
+    reliable_only: bool = True,
+) -> RunComparison:
+    """Score identical samples through two engine configs and diff them, freeing
+    engine A before loading engine B so both fit on one device.
+
+    ``reliable_only`` applies the same population filter as the headline metrics
+    so every metric block in one report describes the same rows. Score MAE and
+    bucket-flip rate are paired (same row, run A vs run B); the per-run metric
+    blocks and latency summaries are per-config.
+    """
+    import gc
+
+    import torch
+
+    from .engine import EditLens
+
+    def free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    eng_a = EditLens(**kwargs_a)
+    used_model, used_device = eng_a.model_name, eng_a.device
+    scored_a = score_samples(samples, engine=eng_a, with_source=with_source)
+    del eng_a
+    free()
+
+    eng_b = EditLens(**kwargs_b)
+    scored_b = score_samples(samples, engine=eng_b, with_source=with_source)
+    del eng_b
+    free()
+
+    if reliable_only:
+        keep = [
+            i
+            for i in range(len(samples))
+            if scored_a[i].reliable and scored_b[i].reliable
+        ]
+        scored_a = [scored_a[i] for i in keep]
+        scored_b = [scored_b[i] for i in keep]
+
+    a_scores = np.array([s.model_score for s in scored_a], dtype=float)
+    b_scores = np.array([s.model_score for s in scored_b], dtype=float)
+    deltas = np.abs(a_scores - b_scores)
+    flips = sum(
+        a.model_bucket != b.model_bucket
+        for a, b in zip(scored_a, scored_b, strict=True)
+    )
+    n = len(scored_a)
+    return RunComparison(
+        label_a=labels[0],
+        label_b=labels[1],
+        model=used_model,
+        device=used_device,
+        n=n,
+        score_mae=float(deltas.mean()) if n else float("nan"),
+        max_delta=float(deltas.max()) if n else float("nan"),
+        bucket_flip_rate=flips / n if n else float("nan"),
+        metrics_a=compute_dataset_metrics(scored_a, with_source=with_source),
+        metrics_b=compute_dataset_metrics(scored_b, with_source=with_source),
+        latency_a=_latency_summary(scored_a),
+        latency_b=_latency_summary(scored_b),
+        scored_a=scored_a,
+        scored_b=scored_b,
+    )
 
 
 def compare_quant(
@@ -713,19 +797,15 @@ def compare_quant(
     device: str | None = None,
     with_source: bool = False,
     reliable_only: bool = True,
-) -> QuantComparison:
-    """Score the same samples 4-bit then bf16 on one CUDA device and diff them.
+) -> RunComparison:
+    """Diff 4-bit against bf16 on the same samples and one CUDA device.
 
-    Frees the quantized engine before loading the unquantized one so both fit. Raises
-    off CUDA or on the roberta backbone, neither of which has a 4-bit path to compare.
-    ``reliable_only`` applies the same population filter as the headline metrics so
-    the per-run metric blocks in one report describe the same rows.
+    Raises off CUDA or on the roberta backbone, neither of which has a 4-bit
+    path to compare.
     """
-    import gc
-
     import torch
 
-    from .engine import EditLens, select_device
+    from .engine import select_device
 
     resolved = select_device(device)
     if not resolved.startswith("cuda") or torch.version.hip is not None:
@@ -736,44 +816,34 @@ def compare_quant(
         raise RuntimeError(
             "compare_quant targets the llama backbone; roberta has no 4-bit path"
         )
-
-    eng_q = EditLens(model=model, base=base, device=device, quantize=True)
-    used_model, used_device = eng_q.model_name, eng_q.device
-    scored_q = score_samples(samples, engine=eng_q, with_source=with_source)
-    del eng_q
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    eng_f = EditLens(model=model, base=base, device=device, quantize=False)
-    scored_f = score_samples(samples, engine=eng_f, with_source=with_source)
-    del eng_f
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    if reliable_only:
-        keep = [i for i, s in enumerate(scored_q) if s.reliable]
-        scored_q = [scored_q[i] for i in keep]
-        scored_f = [scored_f[i] for i in keep]
-
-    q_scores = np.array([s.model_score for s in scored_q], dtype=float)
-    f_scores = np.array([s.model_score for s in scored_f], dtype=float)
-    deltas = np.abs(q_scores - f_scores)
-    flips = sum(
-        q.model_bucket != f.model_bucket
-        for q, f in zip(scored_q, scored_f, strict=True)
+    common = {"model": model, "base": base, "device": device}
+    return _compare_runs(
+        samples,
+        {**common, "quantize": True},
+        {**common, "quantize": False},
+        ("4-bit", "bf16"),
+        with_source=with_source,
+        reliable_only=reliable_only,
     )
-    n = len(scored_q)
-    return QuantComparison(
-        model=used_model,
-        device=used_device,
-        n=n,
-        score_mae=float(deltas.mean()) if n else float("nan"),
-        max_delta=float(deltas.max()) if n else float("nan"),
-        bucket_flip_rate=flips / n if n else float("nan"),
-        metrics_quant=compute_dataset_metrics(scored_q, with_source=with_source),
-        metrics_bf16=compute_dataset_metrics(scored_f, with_source=with_source),
-        scored_quant=scored_q,
-        scored_bf16=scored_f,
+
+
+def compare_models(
+    samples: list[Sample],
+    *,
+    device: str | None = None,
+    quantize: bool | None = None,
+    with_source: bool = False,
+    reliable_only: bool = True,
+) -> RunComparison:
+    """llama vs roberta head-to-head on identical samples: paired score deltas,
+    per-model agreement metrics, and per-model latency."""
+    return _compare_runs(
+        samples,
+        {"model": "llama", "device": device, "quantize": quantize},
+        {"model": "roberta", "device": device},
+        ("llama", "roberta"),
+        with_source=with_source,
+        reliable_only=reliable_only,
     )
 
 
@@ -809,7 +879,7 @@ class DatasetReport:
     metrics: DatasetMetrics
     bands: BandProposal
     latency: dict = field(default_factory=dict)
-    quant_compare: QuantComparison | None = None
+    compare: RunComparison | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -826,9 +896,7 @@ class DatasetReport:
             "metrics": self.metrics.to_dict(),
             "bands": self.bands.to_dict(),
             "latency": self.latency,
-            "quant_compare": self.quant_compare.to_dict()
-            if self.quant_compare
-            else None,
+            "compare": self.compare.to_dict() if self.compare else None,
         }
 
 
@@ -842,14 +910,22 @@ def eval_dataset(
     device: str | None = None,
     quantize: bool | None = None,
     reliable_only: bool = True,
-    compare: bool = False,
+    compare: str | None = None,
     with_source: bool = False,
 ) -> DatasetReport:
-    """End-to-end labeled-dataset eval: load, score, measure, propose bands."""
+    """End-to-end labeled-dataset eval: load, score, measure, propose bands.
+
+    ``compare`` selects an optional paired A/B: ``"quant"`` (4-bit vs bf16) or
+    ``"models"`` (llama vs roberta). In compare mode the headline metrics and
+    band proposal read run A, so the report stays comparable to a plain run.
+    """
+    if compare not in (None, "quant", "models"):
+        raise ValueError(f"unknown compare mode {compare!r}")
     samples = load_samples(n, split=split, seed=seed)
-    quant_compare = None
-    if compare:
-        quant_compare = compare_quant(
+    comparison = None
+    used_quantized = False
+    if compare == "quant":
+        comparison = compare_quant(
             samples,
             model=model,
             base=base,
@@ -857,9 +933,19 @@ def eval_dataset(
             with_source=with_source,
             reliable_only=reliable_only,
         )
-        scored = quant_compare.scored_quant
-        used_model, used_device = quant_compare.model, quant_compare.device
         used_quantized = True
+    elif compare == "models":
+        comparison = compare_models(
+            samples,
+            device=device,
+            quantize=quantize,
+            with_source=with_source,
+            reliable_only=reliable_only,
+        )
+        used_quantized = quantize is not False
+    if comparison is not None:
+        scored = comparison.scored_a
+        used_model, used_device = comparison.model, comparison.device
     else:
         from .engine import EditLens
 
@@ -872,7 +958,7 @@ def eval_dataset(
     metrics = compute_dataset_metrics(used, with_source=with_source, seed=seed)
     bands = propose_bands(used, seed=seed)
     return DatasetReport(
-        n_total=len(scored),
+        n_total=len(samples),
         n_used=len(used),
         reliable_only=reliable_only,
         split=split,
@@ -884,7 +970,7 @@ def eval_dataset(
         metrics=metrics,
         bands=bands,
         latency=_latency_summary(used),
-        quant_compare=quant_compare,
+        compare=comparison,
     )
 
 
@@ -1037,11 +1123,71 @@ def smoke_gradient(
     )
 
 
+def bands_artifact(report: DatasetReport) -> dict:
+    """Serialize a proposed band table as a reusable calibration artifact.
+
+    The artifact records the cuts *and* their provenance (dataset, split, seed,
+    sample size, pinned/interpolated status, CIs) so a consumer can judge
+    whether to trust it. Schema consumed by ``band_for(..., bands=...)``.
+    """
+    return {
+        "version": 1,
+        "kind": "cx-pangram-bands",
+        "model": report.model,
+        "cuts": [
+            {"lt": cut, "band": name, "pinned": pinned}
+            for cut, name, pinned in report.bands.boundaries
+        ],
+        "top_band": "fully AI",
+        "cut_cis": report.bands.cut_cis,
+        "degenerate": report.bands.degenerate,
+        "provenance": {
+            "dataset": DATASET_ID,
+            "split": report.split,
+            "seed": report.seed,
+            "n_used": report.n_used,
+            "reliable_only": report.reliable_only,
+            "quantized": report.quantized,
+        },
+    }
+
+
+def format_markdown_summary(report: DatasetReport) -> str:
+    """GFM benchmarks table for the README, with the reproduction command."""
+    m = report.metrics
+    ci = m.cis
+
+    def cell(v: float, key: str | None = None) -> str:
+        s = _fmt(v)
+        if key and ci.get(key) and not any(np.isnan(x) for x in ci[key]):
+            lo, hi = ci[key]
+            s += f" [{_fmt(lo)}, {_fmt(hi)}]"
+        return s
+
+    quant = "4-bit" if report.quantized else "unquantized"
+    rows = [
+        "| model | n | bucket acc | adjacent | spearman | auroc h\\|e | p50 latency |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+        f"| {report.model} ({quant}) | {report.n_used} "
+        f"| {cell(m.bucket_accuracy, 'bucket_accuracy')} "
+        f"| {cell(m.adjacent_accuracy, 'adjacent_accuracy')} "
+        f"| {cell(m.spearman_score, 'spearman_score')} "
+        f"| {cell(m.auroc_human, 'auroc_human')} "
+        f"| {_fmt(report.latency.get('p50_s'))}s |",
+    ]
+    cmd = (
+        f"cx-pangram eval -n {report.n_total} --seed {report.seed} "
+        f"--split {report.split} --model {report.model}"
+    )
+    rows += ["", f"Reproduce: `{cmd}` (bracketed ranges are 95% bootstrap CIs)."]
+    return "\n".join(rows)
+
+
 def _flat(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def _fmt(x: float, places: int = 3) -> str:
+def _fmt(x: float | None, places: int = 3) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return "—"
     return f"{x:.{places}f}"
@@ -1141,13 +1287,24 @@ def format_dataset_report(report: DatasetReport) -> str:
             f"p95={_fmt(report.latency['p95_s'])}s · "
             f"{_fmt(report.latency['words_per_s'], 0)} words/s"
         )
-    if report.quant_compare:
-        qc = report.quant_compare
+    if report.compare:
+        qc = report.compare
         lines.append("")
         lines.append(
-            f"[bold]4-bit vs bf16[/bold]  score MAE={_fmt(qc.score_mae)} "
+            f"[bold]{qc.label_a} vs {qc.label_b}[/bold]  "
+            f"score MAE={_fmt(qc.score_mae)} "
             f"max Δ={_fmt(qc.max_delta)} bucket-flip={_fmt(qc.bucket_flip_rate)}"
         )
+        for label, m, lat in (
+            (qc.label_a, qc.metrics_a, qc.latency_a),
+            (qc.label_b, qc.metrics_b, qc.latency_b),
+        ):
+            lines.append(
+                f"  {label:<8} acc={_fmt(m.bucket_accuracy)} "
+                f"spearman={_fmt(m.spearman_score)} "
+                f"p50={_fmt(lat.get('p50_s'))}s · "
+                f"{_fmt(lat.get('words_per_s'), 0)} words/s"
+            )
     return "\n".join(lines)
 
 

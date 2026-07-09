@@ -162,6 +162,9 @@ def eval_cmd(
     compare_quant: bool = typer.Option(
         False, "--compare-quant", help="Diff 4-bit vs bf16 on the same samples (CUDA)"
     ),
+    compare_models: bool = typer.Option(
+        False, "--compare-models", help="Diff llama vs roberta on the same samples"
+    ),
     reliable_only: bool = typer.Option(
         True, "--reliable-only/--all", help="Restrict to >=50-word reliable texts"
     ),
@@ -169,6 +172,14 @@ def eval_cmd(
         False,
         "--with-source",
         help="Also score each row's human source_text as a should-read-human control",
+    ),
+    write_bands: str | None = typer.Option(
+        None,
+        "--write-bands",
+        help="Write the proposed band cuts as a calibration artifact (JSON path)",
+    ),
+    markdown: bool = typer.Option(
+        False, "--markdown", help="Emit a GFM benchmarks table instead of the report"
     ),
     smoke: bool = typer.Option(
         False, "--smoke", help="Run the Ishiguro monotonicity probe instead"
@@ -182,6 +193,9 @@ def eval_cmd(
 
     if not verbose:
         lens_core.quiet()
+
+    if compare_quant and compare_models:
+        raise typer.BadParameter("--compare-quant and --compare-models are exclusive")
 
     quantize = False if no_quantize else None
 
@@ -213,18 +227,26 @@ def eval_cmd(
             ev.format_refs_report,
         )
 
-    _emit(
-        ev.eval_dataset(
-            n=samples,
-            split=split,
-            seed=seed,
-            model=model,
-            base=base,
-            device=device,
-            quantize=quantize,
-            reliable_only=reliable_only,
-            compare=compare_quant,
-            with_source=with_source,
-        ),
-        ev.format_dataset_report,
+    compare = "quant" if compare_quant else "models" if compare_models else None
+    report = ev.eval_dataset(
+        n=samples,
+        split=split,
+        seed=seed,
+        model=model,
+        base=base,
+        device=device,
+        quantize=quantize,
+        reliable_only=reliable_only,
+        compare=compare,
+        with_source=with_source,
     )
+    if write_bands:
+        import json
+        from pathlib import Path
+
+        Path(write_bands).write_text(json.dumps(ev.bands_artifact(report), indent=2))
+        console.print(f"[dim]wrote band artifact to {write_bands}[/dim]")
+    if markdown:
+        typer.echo(ev.format_markdown_summary(report))
+        raise typer.Exit()
+    _emit(report, ev.format_dataset_report)

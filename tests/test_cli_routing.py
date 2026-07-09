@@ -133,3 +133,36 @@ def test_no_quantize_threads_false(calls):
     assert calls["eval_dataset"]["quantize"] is False
     runner.invoke(cli.app, ["eval", "--json"])
     assert calls["eval_dataset"]["quantize"] is None
+
+
+def test_compare_flags_thread_mode_and_are_exclusive(calls):
+    runner.invoke(cli.app, ["eval", "--compare-quant", "--json"])
+    assert calls["eval_dataset"]["compare"] == "quant"
+    runner.invoke(cli.app, ["eval", "--compare-models", "--json"])
+    assert calls["eval_dataset"]["compare"] == "models"
+    result = runner.invoke(
+        cli.app, ["eval", "--compare-quant", "--compare-models", "--json"]
+    )
+    assert result.exit_code != 0
+
+
+def test_with_source_threads_through(calls):
+    runner.invoke(cli.app, ["eval", "--with-source", "--json"])
+    assert calls["eval_dataset"]["with_source"] is True
+
+
+def test_write_bands_writes_artifact(calls, monkeypatch, tmp_path):
+    import json
+
+    monkeypatch.setattr(ev, "bands_artifact", lambda report: {"kind": "stub"})
+    path = tmp_path / "bands.json"
+    result = runner.invoke(cli.app, ["eval", "--json", "--write-bands", str(path)])
+    assert result.exit_code == 0
+    assert json.loads(path.read_text()) == {"kind": "stub"}
+
+
+def test_markdown_routes_to_summary(calls, monkeypatch):
+    monkeypatch.setattr(ev, "format_markdown_summary", lambda report: "| md table |")
+    result = runner.invoke(cli.app, ["eval", "--markdown"])
+    assert result.exit_code == 0
+    assert "| md table |" in result.output
