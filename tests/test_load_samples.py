@@ -1,4 +1,4 @@
-"""load_sample over a canned streaming-dataset seam (no network / no gated access)."""
+"""load_samples over a canned streaming-dataset seam (no network / no gated access)."""
 
 import importlib.util
 import sys
@@ -33,9 +33,7 @@ def _install_fake_datasets(monkeypatch, rows, capture=None):
 
     def load_dataset(dataset_id, split=None, streaming=False):
         if capture is not None:
-            capture.update(
-                {"id": dataset_id, "split": split, "streaming": streaming}
-            )
+            capture.update({"id": dataset_id, "split": split, "streaming": streaming})
         return stream
 
     fake = types.ModuleType("datasets")
@@ -53,10 +51,10 @@ def _rows():
     ]
 
 
-def test_load_sample_builds_samples(monkeypatch):
+def test_load_samples_builds_samples(monkeypatch):
     capture = {}
     _install_fake_datasets(monkeypatch, _rows(), capture)
-    samples = ev.load_sample(3, split="test", seed=7)
+    samples = ev.load_samples(3, split="test", seed=7)
     assert capture == {"id": ev.DATASET_ID, "split": "test", "streaming": True}
     assert len(samples) == 3
     assert [s.gt_bucket for s in samples] == [0, 1, 3]
@@ -65,24 +63,24 @@ def test_load_sample_builds_samples(monkeypatch):
     assert samples[0].source_text == "src one"
 
 
-def test_load_sample_passes_seed_and_buffer(monkeypatch):
+def test_load_samples_passes_seed_and_buffer(monkeypatch):
     stream = _install_fake_datasets(monkeypatch, _rows())
-    ev.load_sample(2, seed=42, buffer_size=1234)
+    ev.load_samples(2, seed=42, buffer_size=1234)
     assert stream.shuffle_calls == [(42, 1234)]
     assert stream.take_n == 2
 
 
-def test_load_sample_take_limits_rows(monkeypatch):
+def test_load_samples_take_limits_rows(monkeypatch):
     _install_fake_datasets(monkeypatch, _rows())
-    samples = ev.load_sample(2)
+    samples = ev.load_samples(2)
     assert len(samples) == 2
 
 
-def test_load_sample_missing_datasets_is_actionable(monkeypatch):
+def test_load_samples_missing_datasets_is_actionable(monkeypatch):
     if importlib.util.find_spec("datasets") is not None:
         pytest.skip("datasets is installed; cannot exercise the missing path")
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.delitem(sys.modules, "datasets", raising=False)
     with pytest.raises(ModuleNotFoundError) as excinfo:
-        ev.load_sample(1)
+        ev.load_samples(1)
     assert "datasets" in str(excinfo.value) or "cx-pangram[eval]" in str(excinfo.value)

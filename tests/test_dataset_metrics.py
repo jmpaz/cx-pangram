@@ -15,7 +15,9 @@ def _scored(gt_bucket, model_bucket, model_score, cosine_score, *, reliable=True
         gt_bucket=gt_bucket,
         model_score=model_score,
         model_bucket=model_bucket,
-        band="band",
+        model_bucket_argmax=model_bucket,
+        probs=[],
+        latency_s=0.01,
     )
 
 
@@ -92,15 +94,50 @@ def test_metrics_to_dict_stringifies_per_gt_keys():
     assert d["confusion"] and "spearman_score" in d
 
 
-def test_propose_bands_pins_endpoints_and_interpolates_interior():
-    prop = propose_bands(_gradient())
+def test_propose_bands_pins_three_cuts_and_interpolates_one():
+    prop = propose_bands(_gradient(), n_boot=50)
     cuts = [c for c, _, _ in prop.boundaries]
     pinned = [p for _, _, p in prop.boundaries]
     names = [name for _, name, _ in prop.boundaries]
     assert names == ["human", "lightly edited", "moderately edited", "heavily edited"]
-    assert pinned == [True, False, False, True]
+    assert pinned == [True, True, False, True]
     assert cuts == sorted(cuts)
-    assert prop.sweep_human is not None and prop.sweep_ai is not None
-    span = cuts[-1] - cuts[0]
-    assert cuts[1] == pytest.approx(cuts[0] + span / 3, abs=1e-3)
-    assert cuts[2] == pytest.approx(cuts[0] + 2 * span / 3, abs=1e-3)
+    assert all(prop.sweeps[k] is not None for k in ("human", "light", "top"))
+    assert not prop.degenerate
+    assert cuts[2] == pytest.approx((cuts[1] + cuts[3]) / 2, abs=1e-3)
+
+
+def test_propose_bands_cut_cis_are_seeded_and_ordered():
+    a = propose_bands(_gradient(), n_boot=50, seed=3)
+    b = propose_bands(_gradient(), n_boot=50, seed=3)
+    assert a.cut_cis == b.cut_cis
+    for lo, hi in a.cut_cis.values():
+        assert lo <= hi
+
+
+def test_propose_bands_degenerate_flag_on_inverted_classes():
+    rows = [_scored(0, 3, 0.9, 0.01) for _ in range(6)] + [
+        _scored(3, 0, 0.05, 0.30) for _ in range(6)
+    ]
+    prop = propose_bands(rows, n_boot=10)
+    assert prop.degenerate
+
+
+def test_argmax_accuracy_tracks_weighted_softmax():
+    rows = _gradient()
+    for r in rows:
+        probs = [0.0] * 4
+        probs[min(3, r.gt_bucket)] = 1.0
+        r.probs = probs
+        r.model_bucket_argmax = r.gt_bucket
+    m = compute_dataset_metrics(rows, n_boot=10)
+    assert m.bucket_accuracy_argmax == pytest.approx(1.0)
+    assert m.ece_argmax == pytest.approx(0.0, abs=1e-9)
+
+
+def test_calibration_bins_track_diagonal_on_agreement():
+    m = compute_dataset_metrics(_gradient(), n_boot=10)
+    assert m.calibration
+    for row in m.calibration:
+        assert 0.0 <= row["mean_score"] <= 1.0
+        assert 0.0 <= row["mean_gt"] <= 1.0

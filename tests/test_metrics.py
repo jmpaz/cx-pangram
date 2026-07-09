@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from cx_pangram.eval import (
+    _auroc,
     _balacc_sweep,
+    _bootstrap_cis,
     _confusion,
     _describe,
     _fp_table,
@@ -92,3 +94,50 @@ def test_balacc_sweep_separates_clean_classes():
 def test_balacc_sweep_empty_class_is_none():
     assert _balacc_sweep([], [0.5]) is None
     assert _balacc_sweep([0.5], []) is None
+
+
+def test_balacc_sweep_picks_plateau_midpoint():
+    neg = [0.0, 0.1, 0.2]
+    pos = [0.8, 0.9, 1.0]
+    best = _balacc_sweep(neg, pos)
+    lo, hi = best["plateau"]
+    assert lo == pytest.approx(0.21)
+    assert hi == pytest.approx(0.8)
+    assert best["threshold"] == pytest.approx((lo + hi) / 2, abs=0.01)
+
+
+def test_auroc_matches_scipy_mannwhitney():
+    scipy_stats = pytest.importorskip("scipy.stats")
+    rng = np.random.default_rng(2)
+    neg = rng.normal(0.3, 0.15, size=50)
+    pos = np.concatenate([rng.normal(0.7, 0.15, size=40), neg[:5]])  # inject ties
+    u = scipy_stats.mannwhitneyu(pos, neg, alternative="two-sided").statistic
+    expected = u / (len(pos) * len(neg))
+    assert _auroc(neg, pos) == pytest.approx(expected, abs=1e-12)
+
+
+def test_auroc_perfect_and_degenerate():
+    assert _auroc([0.1, 0.2], [0.8, 0.9]) == pytest.approx(1.0)
+    assert _auroc([0.8, 0.9], [0.1, 0.2]) == pytest.approx(0.0)
+    assert np.isnan(_auroc([], [0.5]))
+
+
+def test_bootstrap_cis_deterministic_and_ordered():
+    rng = np.random.default_rng(5)
+    xs = rng.normal(0.5, 0.1, size=100)
+    stats = {"mean": lambda idx: float(xs[idx].mean())}
+    a = _bootstrap_cis(stats, len(xs), n_boot=200, seed=11)
+    b = _bootstrap_cis(stats, len(xs), n_boot=200, seed=11)
+    assert a == b
+    lo, hi = a["mean"]
+    assert lo < xs.mean() < hi
+
+
+def test_bootstrap_cis_nan_resamples_dropped():
+    xs = np.array([0.1, 0.9])
+    stats = {
+        "flaky": lambda idx: float("nan") if idx.sum() % 2 else float(xs[idx].mean())
+    }
+    out = _bootstrap_cis(stats, len(xs), n_boot=100, seed=0)
+    lo, hi = out["flaky"]
+    assert not np.isnan(lo) and lo <= hi

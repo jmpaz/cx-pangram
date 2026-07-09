@@ -29,7 +29,9 @@ def _rows():
                     gt_bucket=b,
                     model_score=s,
                     model_bucket=round(s * 3),
-                    band="band",
+                    model_bucket_argmax=round(s * 3),
+                    probs=[],
+                    latency_s=0.01,
                 )
             )
     return rows
@@ -56,10 +58,22 @@ def test_format_dataset_report_mentions_core_metrics():
     out = format_dataset_report(_dataset_report())
     assert "dataset eval" in out
     assert "bucket accuracy" in out
+    assert "argmax variant" in out
+    assert "auroc" in out
+    assert "calibration" in out
     assert "confusion" in out
     assert "proposed bands" in out
     assert "interpolated" in out
     assert "pinned" in out
+
+
+def test_format_dataset_report_renders_latency_and_cis():
+    report = _dataset_report()
+    report.latency = {"p50_s": 0.05, "p95_s": 0.09, "words_per_s": 1200.0}
+    out = format_dataset_report(report)
+    assert "latency" in out
+    assert "words/s" in out
+    assert "[0." in out
 
 
 def test_dataset_report_to_dict_is_serializable():

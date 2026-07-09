@@ -165,6 +165,11 @@ def eval_cmd(
     reliable_only: bool = typer.Option(
         True, "--reliable-only/--all", help="Restrict to >=50-word reliable texts"
     ),
+    with_source: bool = typer.Option(
+        False,
+        "--with-source",
+        help="Also score each row's human source_text as a should-read-human control",
+    ),
     smoke: bool = typer.Option(
         False, "--smoke", help="Run the Ishiguro monotonicity probe instead"
     ),
@@ -172,8 +177,6 @@ def eval_cmd(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show model load logs"),
 ):
     """Faithfulness eval: labeled dataset, unlabeled refs, or the smoke gradient."""
-    import json as _json
-
     from . import eval as ev
     from . import lens as lens_core
 
@@ -182,43 +185,46 @@ def eval_cmd(
 
     quantize = False if no_quantize else None
 
-    if smoke:
-        report = ev.smoke_gradient(
-            model=model, base=base, device=device, quantize=quantize
-        )
+    def _emit(report, formatter) -> None:
         if json_out:
-            typer.echo(_json.dumps(report.to_dict()))
+            import json
+
+            typer.echo(json.dumps(report.to_dict()))
         else:
-            console.print(ev.format_smoke_report(report))
+            console.print(formatter(report))
         raise typer.Exit()
 
+    if smoke:
+        _emit(
+            ev.smoke_gradient(model=model, base=base, device=device, quantize=quantize),
+            ev.format_smoke_report,
+        )
+
     if targets:
-        report = ev.eval_refs(
-            targets,
+        _emit(
+            ev.eval_refs(
+                targets,
+                model=model,
+                base=base,
+                device=device,
+                quantize=quantize,
+                reliable_only=reliable_only,
+            ),
+            ev.format_refs_report,
+        )
+
+    _emit(
+        ev.eval_dataset(
+            n=samples,
+            split=split,
+            seed=seed,
             model=model,
             base=base,
             device=device,
             quantize=quantize,
             reliable_only=reliable_only,
-        )
-        if json_out:
-            typer.echo(_json.dumps(report.to_dict()))
-        else:
-            console.print(ev.format_refs_report(report))
-        raise typer.Exit()
-
-    report = ev.eval_dataset(
-        n=samples,
-        split=split,
-        seed=seed,
-        model=model,
-        base=base,
-        device=device,
-        quantize=quantize,
-        reliable_only=reliable_only,
-        compare=compare_quant,
+            compare=compare_quant,
+            with_source=with_source,
+        ),
+        ev.format_dataset_report,
     )
-    if json_out:
-        typer.echo(_json.dumps(report.to_dict()))
-    else:
-        console.print(ev.format_dataset_report(report))

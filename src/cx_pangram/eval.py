@@ -13,9 +13,15 @@ from __future__ import annotations
 
 import os
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .engine import EditLens
 
 DATASET_ID = "pangram/editlens_iclr"
 N_BUCKETS = 4
@@ -83,18 +89,25 @@ class Scored:
     gt_bucket: int
     model_score: float
     model_bucket: int
-    band: str
+    model_bucket_argmax: int
+    probs: list[float]
+    latency_s: float
     source_score: float | None = None
     source_bucket: int | None = None
 
 
-def load_sample(
+def load_samples(
     n: int, *, split: str = "test", seed: int = 0, buffer_size: int = 5000
 ) -> list[Sample]:
     """Stream ``n`` shuffled rows of the gated dataset into :class:`Sample`s.
 
     ``n_words`` is computed through the project's own ``preprocess`` so the
     reliability floor here matches what ``engine.detect`` will apply downstream.
+
+    ``shuffle(buffer_size=...)`` is a streaming approximation: rows are drawn
+    from a rolling buffer, not uniformly from the whole split. Deterministic
+    under ``seed``, but not an unbiased sample when the split is much larger
+    than the buffer.
     """
     _ensure_hf_token()
     try:
@@ -131,12 +144,26 @@ def load_sample(
     return samples
 
 
-def _score_one(engine, sample: Sample, with_source: bool) -> Scored:
+def _weighted_probs(det) -> list[float]:
+    """Length-weighted mean of per-chunk softmax vectors; the document-level
+    bucket distribution that ``argmax`` metrics and ECE read from."""
+    if not det.chunks:
+        return []
+    weights = np.array([c.n_words for c in det.chunks], dtype=float)
+    probs = np.array([c.probs for c in det.chunks], dtype=float)
+    total = weights.sum() or 1.0
+    return (probs * weights[:, None]).sum(axis=0) / total
+
+
+def _score_one(engine: EditLens, sample: Sample, with_source: bool) -> Scored:
+    t0 = time.perf_counter()
     det = engine.detect(sample.text)
+    latency_s = time.perf_counter() - t0
     src_score = src_bucket = None
     if with_source and sample.source_text:
         sdet = engine.detect(sample.source_text)
         src_score, src_bucket = sdet.score, sdet.bucket
+    probs = _weighted_probs(det)
     return Scored(
         preview=_flat(sample.text)[:80],
         n_words=det.n_words,
@@ -145,7 +172,9 @@ def _score_one(engine, sample: Sample, with_source: bool) -> Scored:
         gt_bucket=sample.gt_bucket,
         model_score=det.score,
         model_bucket=det.bucket,
-        band=det.band,
+        model_bucket_argmax=int(np.argmax(probs)) if len(probs) else det.bucket,
+        probs=[float(p) for p in probs],
+        latency_s=latency_s,
         source_score=src_score,
         source_bucket=src_bucket,
     )
@@ -217,7 +246,7 @@ def _confusion(gt, pred, n_buckets: int = N_BUCKETS) -> np.ndarray:
     gt = np.asarray(gt, dtype=int)
     pred = np.asarray(pred, dtype=int)
     m = np.zeros((n_buckets, n_buckets), dtype=int)
-    for g, p in zip(gt, pred):
+    for g, p in zip(gt, pred, strict=True):
         if not (0 <= g < n_buckets and 0 <= p < n_buckets):
             raise ValueError(
                 f"bucket index out of range for {n_buckets} buckets: gt={g}, pred={p}"
@@ -248,9 +277,24 @@ def _fp_table(
     xs, thresholds: tuple[float, ...] = _FP_THRESHOLDS
 ) -> list[tuple[float, int]]:
     """Count of scores at or above each threshold; on all-human input these are
-    false positives. Ported from the are.na distribution probe."""
+    false positives."""
     xs = np.asarray(xs, dtype=float)
     return [(t, int((xs >= t).sum())) for t in thresholds]
+
+
+def _auroc(neg, pos) -> float:
+    """AUROC via the Mann–Whitney U statistic on average ranks (tie-correct).
+
+    Probability that a random positive outscores a random negative; the
+    threshold-free companion to the balanced-accuracy sweep."""
+    neg = np.asarray(neg, dtype=float)
+    pos = np.asarray(pos, dtype=float)
+    if neg.size == 0 or pos.size == 0:
+        return float("nan")
+    ranks = _rankdata(np.concatenate([neg, pos]))
+    r_pos = ranks[neg.size :].sum()
+    u = r_pos - pos.size * (pos.size + 1) / 2.0
+    return float(u / (pos.size * neg.size))
 
 
 def _balacc_sweep(
@@ -258,84 +302,208 @@ def _balacc_sweep(
 ) -> dict | None:
     """Threshold over ``[lo, hi]`` maximizing balanced accuracy (neg below, pos at/above).
 
-    Returns ``None`` when either class is empty. Generalized from the are.na
-    human-vs-AI separation sweep.
+    Ties across a plateau of equally good thresholds resolve to the plateau
+    midpoint rather than its left edge, so the cut sits centrally in the score
+    gap instead of hugging the negative class. Returns ``None`` when either
+    class is empty.
     """
     neg = np.asarray(neg, dtype=float)
     pos = np.asarray(pos, dtype=float)
     if neg.size == 0 or pos.size == 0:
         return None
-    best: dict | None = None
-    for t in np.round(np.arange(lo, hi + 1e-9, step), 4):
-        tp = int((pos >= t).sum())
-        tn = int((neg < t).sum())
-        tpr = tp / pos.size
-        tnr = tn / neg.size
-        bal = (tpr + tnr) / 2.0
-        if best is None or bal > best["bal_acc"]:
-            best = {
-                "threshold": float(t),
-                "bal_acc": float(bal),
-                "tp": tp,
-                "n_pos": int(pos.size),
-                "fp": int(neg.size - tn),
-                "n_neg": int(neg.size),
+    ts = np.round(np.arange(lo, hi + 1e-9, step), 4)
+    tpr = (pos[None, :] >= ts[:, None]).mean(axis=1)
+    tnr = (neg[None, :] < ts[:, None]).mean(axis=1)
+    bal = (tpr + tnr) / 2.0
+    best_mask = bal == bal.max()
+    plateau = ts[best_mask]
+    t = float(np.round(np.median(plateau), 4))
+    tp = int((pos >= t).sum())
+    tn = int((neg < t).sum())
+    return {
+        "threshold": t,
+        "bal_acc": float(bal.max()),
+        "plateau": [float(plateau.min()), float(plateau.max())],
+        "tp": tp,
+        "n_pos": int(pos.size),
+        "fp": int(neg.size - tn),
+        "n_neg": int(neg.size),
+    }
+
+
+def _bootstrap_cis(
+    stats: dict[str, Callable[[np.ndarray], float]],
+    n: int,
+    *,
+    n_boot: int = 1000,
+    seed: int = 0,
+    alpha: float = 0.05,
+) -> dict[str, list[float]]:
+    """Nonparametric bootstrap percentile CIs.
+
+    Each stat receives an index array into the scored sample and returns a
+    float; resampling is shared across stats so their CIs come from the same
+    draws. NaN resamples (e.g. a draw with one class absent) are dropped
+    per-stat before taking percentiles.
+    """
+    if n == 0:
+        return {k: [float("nan"), float("nan")] for k in stats}
+    rng = np.random.default_rng(seed)
+    draws: dict[str, list[float]] = {k: [] for k in stats}
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        for key, fn in stats.items():
+            draws[key].append(fn(idx))
+    out: dict[str, list[float]] = {}
+    for key, vals in draws.items():
+        arr = np.asarray(vals, dtype=float)
+        arr = arr[~np.isnan(arr)]
+        if arr.size == 0:
+            out[key] = [float("nan"), float("nan")]
+        else:
+            lo, hi = np.percentile(arr, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+            out[key] = [float(lo), float(hi)]
+    return out
+
+
+def _calibration_read(ms: np.ndarray, gt: np.ndarray, n_bins: int = 5) -> list[dict]:
+    """Quantile-binned reliability read: mean model score vs mean normalized
+    ground-truth bucket per bin.
+
+    ``model_score`` is an expected bucket index, not a probability, so classic
+    calibration curves don't apply directly; this compares the two quantities
+    on the shared ``[0, 1]`` scale within score quantiles. A well-calibrated
+    decode tracks the diagonal.
+    """
+    if ms.size == 0:
+        return []
+    edges = np.percentile(ms, np.linspace(0, 100, n_bins + 1))
+    edges[-1] += 1e-9
+    out: list[dict] = []
+    gt_norm = gt / (N_BUCKETS - 1)
+    for i in range(n_bins):
+        mask = (ms >= edges[i]) & (ms < edges[i + 1])
+        if not mask.any():
+            continue
+        out.append(
+            {
+                "n": int(mask.sum()),
+                "mean_score": float(ms[mask].mean()),
+                "mean_gt": float(gt_norm[mask].mean()),
             }
-    return best
+        )
+    return out
+
+
+def _ece(probs: np.ndarray, gt: np.ndarray, n_bins: int = 10) -> float:
+    """Expected calibration error of the argmax-bucket confidence.
+
+    Uses the document-level weighted softmax: confidence = max prob, correct =
+    argmax bucket equals ground truth. This is the one probability the decode
+    actually emits, so it is the honest place to measure calibration.
+    """
+    if probs.size == 0:
+        return float("nan")
+    conf = probs.max(axis=1)
+    correct = probs.argmax(axis=1) == gt
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = i / n_bins, (i + 1) / n_bins
+        mask = (conf >= lo) & (conf < hi if i < n_bins - 1 else conf <= hi)
+        if not mask.any():
+            continue
+        ece += (mask.mean()) * abs(conf[mask].mean() - correct[mask].mean())
+    return float(ece)
 
 
 @dataclass
 class DatasetMetrics:
     n: int
     bucket_accuracy: float
+    bucket_accuracy_argmax: float
     adjacent_accuracy: float
     bucket_mae: float
     confusion: list[list[int]]
     spearman_score: float
     spearman_bucket: float
+    auroc_human: float
+    auroc_top: float
+    ece_argmax: float
+    calibration: list[dict]
+    cis: dict[str, list[float]]
     per_gt_score: dict[int, dict]
+    worst_disagreements: list[dict]
     source_control: dict | None = None
 
     def to_dict(self) -> dict:
         return {
             "n": self.n,
             "bucket_accuracy": self.bucket_accuracy,
+            "bucket_accuracy_argmax": self.bucket_accuracy_argmax,
             "adjacent_accuracy": self.adjacent_accuracy,
             "bucket_mae": self.bucket_mae,
             "confusion": self.confusion,
             "spearman_score": self.spearman_score,
             "spearman_bucket": self.spearman_bucket,
+            "auroc_human": self.auroc_human,
+            "auroc_top": self.auroc_top,
+            "ece_argmax": self.ece_argmax,
+            "calibration": self.calibration,
+            "cis": self.cis,
             "per_gt_score": {str(k): v for k, v in self.per_gt_score.items()},
+            "worst_disagreements": self.worst_disagreements,
             "source_control": self.source_control,
         }
 
 
+def _empty_metrics(n_buckets: int) -> DatasetMetrics:
+    nan = float("nan")
+    return DatasetMetrics(
+        n=0,
+        bucket_accuracy=nan,
+        bucket_accuracy_argmax=nan,
+        adjacent_accuracy=nan,
+        bucket_mae=nan,
+        confusion=[[0] * n_buckets for _ in range(n_buckets)],
+        spearman_score=nan,
+        spearman_bucket=nan,
+        auroc_human=nan,
+        auroc_top=nan,
+        ece_argmax=nan,
+        calibration=[],
+        cis={},
+        per_gt_score={},
+        worst_disagreements=[],
+        source_control=None,
+    )
+
+
 def compute_dataset_metrics(
-    scored: list[Scored], n_buckets: int = N_BUCKETS, with_source: bool = False
+    scored: list[Scored],
+    n_buckets: int = N_BUCKETS,
+    with_source: bool = False,
+    *,
+    n_boot: int = 1000,
+    seed: int = 0,
 ) -> DatasetMetrics:
     """Agreement between the local decode and the dataset ground truth.
 
     Buckets are compared directly (same ``0..n_buckets-1`` index space); the
     continuous ``cosine_score`` is compared to ``model_score`` only through Spearman
-    rank correlation, never by subtraction across the two scales. ``model_bucket`` is
-    the engine's rounded expected bucket (``round(score·(n-1))``), not ``argmax``.
+    rank correlation, never by subtraction across the two scales. Two bucket
+    accuracies are reported: ``model_bucket`` (the engine's rounded expected bucket,
+    ``round(score·(n-1))``) and ``model_bucket_argmax`` (mode of the weighted softmax,
+    comparable to EditLens' own argmax-based confusion). Headline metrics carry
+    seeded bootstrap percentile CIs.
     """
     if not scored:
-        return DatasetMetrics(
-            n=0,
-            bucket_accuracy=float("nan"),
-            adjacent_accuracy=float("nan"),
-            bucket_mae=float("nan"),
-            confusion=[[0] * n_buckets for _ in range(n_buckets)],
-            spearman_score=float("nan"),
-            spearman_bucket=float("nan"),
-            per_gt_score={},
-            source_control=None,
-        )
+        return _empty_metrics(n_buckets)
     gt = np.array([s.gt_bucket for s in scored])
     mb = np.array([s.model_bucket for s in scored])
+    mba = np.array([s.model_bucket_argmax for s in scored])
     ms = np.array([s.model_score for s in scored], dtype=float)
     cs = np.array([s.cosine_score for s in scored], dtype=float)
+    probs = np.array([s.probs for s in scored], dtype=float)
 
     per_gt: dict[int, dict] = {}
     for b in range(n_buckets):
@@ -355,15 +523,60 @@ def compute_dataset_metrics(
                 "frac_bucket0": float((np.asarray(src_buckets) == 0).mean()),
             }
 
+    def auroc_human(idx: np.ndarray) -> float:
+        g, m = gt[idx], ms[idx]
+        return _auroc(m[g == 0], m[g >= 1])
+
+    def auroc_top(idx: np.ndarray) -> float:
+        g, m = gt[idx], ms[idx]
+        return _auroc(m[g <= n_buckets - 2], m[g == n_buckets - 1])
+
+    cis = _bootstrap_cis(
+        {
+            "bucket_accuracy": lambda idx: float((gt[idx] == mb[idx]).mean()),
+            "adjacent_accuracy": lambda idx: float(
+                (np.abs(gt[idx] - mb[idx]) <= 1).mean()
+            ),
+            "spearman_score": lambda idx: _spearman(ms[idx], cs[idx]),
+            "auroc_human": auroc_human,
+            "auroc_top": auroc_top,
+        },
+        len(scored),
+        n_boot=n_boot,
+        seed=seed,
+    )
+
+    err = np.abs(gt - mb)
+    worst_idx = np.argsort(-(err + np.abs(ms - gt / (n_buckets - 1))))[:3]
+    worst = [
+        {
+            "preview": scored[i].preview,
+            "gt_bucket": int(gt[i]),
+            "model_bucket": int(mb[i]),
+            "model_score": float(ms[i]),
+            "cosine_score": float(cs[i]),
+        }
+        for i in worst_idx
+        if err[i] > 0
+    ]
+
+    all_idx = np.arange(len(scored))
     return DatasetMetrics(
         n=len(scored),
         bucket_accuracy=float((gt == mb).mean()),
+        bucket_accuracy_argmax=float((gt == mba).mean()),
         adjacent_accuracy=float((np.abs(gt - mb) <= 1).mean()),
         bucket_mae=float(np.abs(gt - mb).mean()),
         confusion=_confusion(gt, mb, n_buckets).tolist(),
         spearman_score=_spearman(ms, cs),
         spearman_bucket=_spearman(mb.astype(float), gt.astype(float)),
+        auroc_human=auroc_human(all_idx),
+        auroc_top=auroc_top(all_idx),
+        ece_argmax=_ece(probs, gt) if probs.ndim == 2 else float("nan"),
+        calibration=_calibration_read(ms, gt),
+        cis=cis,
         per_gt_score=per_gt,
+        worst_disagreements=worst,
         source_control=source_control,
     )
 
@@ -371,8 +584,9 @@ def compute_dataset_metrics(
 @dataclass
 class BandProposal:
     boundaries: list[tuple[float, str, bool]]
-    sweep_human: dict | None
-    sweep_ai: dict | None
+    sweeps: dict[str, dict | None]
+    cut_cis: dict[str, list[float]]
+    degenerate: bool
 
     def to_dict(self) -> dict:
         return {
@@ -380,45 +594,88 @@ class BandProposal:
                 {"cut": c, "band_below": name, "pinned": pinned}
                 for c, name, pinned in self.boundaries
             ],
-            "sweep_human": self.sweep_human,
-            "sweep_ai": self.sweep_ai,
+            "sweeps": self.sweeps,
+            "cut_cis": self.cut_cis,
+            "degenerate": self.degenerate,
         }
 
 
-def propose_bands(scored: list[Scored], n_buckets: int = N_BUCKETS) -> BandProposal:
+_SWEEP_KEYS = ("human", "light", "top")
+
+
+def _band_sweeps(
+    scores: np.ndarray, gts: np.ndarray, n_buckets: int
+) -> dict[str, dict | None]:
+    """The three one-vs-rest cuts the four ordinal ground-truth buckets support:
+    gt≤0|≥1 (human), gt≤1|≥2 (light), gt≤2|≥3 (top)."""
+    return {
+        "human": _balacc_sweep(scores[gts == 0], scores[gts >= 1]),
+        "light": _balacc_sweep(scores[gts <= 1], scores[gts >= 2]),
+        "top": _balacc_sweep(
+            scores[gts <= n_buckets - 2], scores[gts == n_buckets - 1]
+        ),
+    }
+
+
+def propose_bands(
+    scored: list[Scored],
+    n_buckets: int = N_BUCKETS,
+    *,
+    n_boot: int = 200,
+    seed: int = 0,
+) -> BandProposal:
     """Derive band cuts on the model-score scale from the ground-truth buckets.
 
-    With only ``n_buckets`` ground-truth levels, the human cut (bucket 0 vs the rest)
-    and the top-AI cut (bucket ``n_buckets-1`` vs the rest) are empirically pinned by a
-    balanced-accuracy sweep; the interior product cuts are linearly interpolated between
-    them and flagged ``pinned=False`` so the report can label them as such.
+    Four ordinal ground-truth buckets support exactly three one-vs-rest cuts, so
+    three of the four band boundaries are empirically pinned by balanced-accuracy
+    sweeps (plateau midpoints); only the ``moderately edited`` cut lacks ground
+    truth and is interpolated between its pinned neighbors, flagged
+    ``pinned=False``. Cuts are forced monotone non-decreasing; ``degenerate``
+    reports when that clamp collapsed a band's span to zero. Each pinned cut
+    carries a seeded bootstrap CI from re-running its sweep over resamples.
     """
-    from .engine import _BANDS
+    from .engine import BANDS
 
     scores = np.array([s.model_score for s in scored], dtype=float)
     gts = np.array([s.gt_bucket for s in scored], dtype=int)
 
-    sweep_human = _balacc_sweep(scores[gts == 0], scores[gts >= 1])
-    sweep_ai = _balacc_sweep(scores[gts <= n_buckets - 2], scores[gts == n_buckets - 1])
+    sweeps = _band_sweeps(scores, gts, n_buckets)
+    defaults = {"human": BANDS[0][0], "light": BANDS[1][0], "top": BANDS[3][0]}
+    cuts = {
+        k: (sweeps[k]["threshold"] if sweeps[k] else defaults[k]) for k in _SWEEP_KEYS
+    }
 
-    t01 = sweep_human["threshold"] if sweep_human else _BANDS[0][0]
-    t_top = sweep_ai["threshold"] if sweep_ai else _BANDS[-1][0]
-    t_top = max(t_top, t01)
+    t_h, t_l, t_top = cuts["human"], cuts["light"], cuts["top"]
+    t_l = max(t_l, t_h)
+    t_top_c = max(t_top, t_l)
+    degenerate = (t_l != cuts["light"]) or (t_top_c != cuts["top"]) or t_h == t_top_c
+    t_top = t_top_c
+    t_m = (t_l + t_top) / 2.0
 
-    names = [name for _, name in _BANDS]
-    span = t_top - t01
-    n_cuts = len(names)
-    boundaries: list[tuple[float, str, bool]] = []
-    for i, name in enumerate(names):
-        if i == 0:
-            cut, pinned = t01, sweep_human is not None
-        elif i == n_cuts - 1:
-            cut, pinned = t_top, sweep_ai is not None
-        else:
-            cut, pinned = t01 + span * (i / (n_cuts - 1)), False
-        boundaries.append((round(cut, 3), name, pinned))
+    names = [name for _, name in BANDS]
+    ordered = [
+        (t_h, names[0], sweeps["human"] is not None),
+        (t_l, names[1], sweeps["light"] is not None),
+        (t_m, names[2], False),
+        (t_top, names[3], sweeps["top"] is not None),
+    ]
+    boundaries = [(round(c, 3), name, pinned) for c, name, pinned in ordered]
+
+    def cut_stat(key: str) -> Callable[[np.ndarray], float]:
+        def stat(idx: np.ndarray) -> float:
+            sw = _band_sweeps(scores[idx], gts[idx], n_buckets)[key]
+            return sw["threshold"] if sw else float("nan")
+
+        return stat
+
+    cut_cis = _bootstrap_cis(
+        {k: cut_stat(k) for k in _SWEEP_KEYS if sweeps[k] is not None},
+        len(scored),
+        n_boot=n_boot,
+        seed=seed,
+    )
     return BandProposal(
-        boundaries=boundaries, sweep_human=sweep_human, sweep_ai=sweep_ai
+        boundaries=boundaries, sweeps=sweeps, cut_cis=cut_cis, degenerate=degenerate
     )
 
 
@@ -455,11 +712,14 @@ def compare_quant(
     base: str | None = None,
     device: str | None = None,
     with_source: bool = False,
+    reliable_only: bool = True,
 ) -> QuantComparison:
     """Score the same samples 4-bit then bf16 on one CUDA device and diff them.
 
     Frees the quantized engine before loading the unquantized one so both fit. Raises
     off CUDA or on the roberta backbone, neither of which has a 4-bit path to compare.
+    ``reliable_only`` applies the same population filter as the headline metrics so
+    the per-run metric blocks in one report describe the same rows.
     """
     import gc
 
@@ -490,11 +750,19 @@ def compare_quant(
     gc.collect()
     torch.cuda.empty_cache()
 
+    if reliable_only:
+        keep = [i for i, s in enumerate(scored_q) if s.reliable]
+        scored_q = [scored_q[i] for i in keep]
+        scored_f = [scored_f[i] for i in keep]
+
     q_scores = np.array([s.model_score for s in scored_q], dtype=float)
     f_scores = np.array([s.model_score for s in scored_f], dtype=float)
     deltas = np.abs(q_scores - f_scores)
-    flips = sum(q.model_bucket != f.model_bucket for q, f in zip(scored_q, scored_f))
-    n = len(samples)
+    flips = sum(
+        q.model_bucket != f.model_bucket
+        for q, f in zip(scored_q, scored_f, strict=True)
+    )
+    n = len(scored_q)
     return QuantComparison(
         model=used_model,
         device=used_device,
@@ -507,6 +775,24 @@ def compare_quant(
         scored_quant=scored_q,
         scored_bf16=scored_f,
     )
+
+
+def _latency_summary(scored: list[Scored]) -> dict:
+    """p50/p95 per-doc latency and aggregate throughput in words/sec."""
+    if not scored:
+        return {
+            "p50_s": float("nan"),
+            "p95_s": float("nan"),
+            "words_per_s": float("nan"),
+        }
+    lat = np.array([s.latency_s for s in scored], dtype=float)
+    words = sum(s.n_words for s in scored)
+    total = lat.sum()
+    return {
+        "p50_s": float(np.percentile(lat, 50)),
+        "p95_s": float(np.percentile(lat, 95)),
+        "words_per_s": float(words / total) if total else float("nan"),
+    }
 
 
 @dataclass
@@ -522,6 +808,7 @@ class DatasetReport:
     quantized: bool
     metrics: DatasetMetrics
     bands: BandProposal
+    latency: dict = field(default_factory=dict)
     quant_compare: QuantComparison | None = None
 
     def to_dict(self) -> dict:
@@ -538,6 +825,7 @@ class DatasetReport:
             "quantized": self.quantized,
             "metrics": self.metrics.to_dict(),
             "bands": self.bands.to_dict(),
+            "latency": self.latency,
             "quant_compare": self.quant_compare.to_dict()
             if self.quant_compare
             else None,
@@ -558,11 +846,16 @@ def eval_dataset(
     with_source: bool = False,
 ) -> DatasetReport:
     """End-to-end labeled-dataset eval: load, score, measure, propose bands."""
-    samples = load_sample(n, split=split, seed=seed)
+    samples = load_samples(n, split=split, seed=seed)
     quant_compare = None
     if compare:
         quant_compare = compare_quant(
-            samples, model=model, base=base, device=device, with_source=with_source
+            samples,
+            model=model,
+            base=base,
+            device=device,
+            with_source=with_source,
+            reliable_only=reliable_only,
         )
         scored = quant_compare.scored_quant
         used_model, used_device = quant_compare.model, quant_compare.device
@@ -576,8 +869,8 @@ def eval_dataset(
         scored = score_samples(samples, engine=engine, with_source=with_source)
 
     used = [s for s in scored if s.reliable] if reliable_only else scored
-    metrics = compute_dataset_metrics(used, with_source=with_source)
-    bands = propose_bands(used)
+    metrics = compute_dataset_metrics(used, with_source=with_source, seed=seed)
+    bands = propose_bands(used, seed=seed)
     return DatasetReport(
         n_total=len(scored),
         n_used=len(used),
@@ -590,6 +883,7 @@ def eval_dataset(
         quantized=used_quantized,
         metrics=metrics,
         bands=bands,
+        latency=_latency_summary(used),
         quant_compare=quant_compare,
     )
 
@@ -761,9 +1055,21 @@ def _describe_line(d: dict) -> str:
     )
 
 
+def _ci_suffix(cis: dict[str, list[float]], key: str) -> str:
+    ci = cis.get(key)
+    if not ci or any(np.isnan(v) for v in ci):
+        return ""
+    return f"  [dim][{_fmt(ci[0])}, {_fmt(ci[1])}][/dim]"
+
+
 def format_dataset_report(report: DatasetReport) -> str:
-    """Human-readable dataset eval summary with rich markup."""
+    """Human-readable dataset eval summary with rich markup.
+
+    Bracketed ranges are seeded 95% bootstrap CIs — at n=200 the headline
+    accuracies carry ±several points of sampling noise, so they print alongside
+    every number they qualify."""
     m = report.metrics
+    cis = m.cis
     lines = [
         f"[bold]dataset eval[/bold]  {report.model} · {report.device} · "
         f"{'4-bit' if report.quantized else 'unquantized'} · "
@@ -771,20 +1077,41 @@ def format_dataset_report(report: DatasetReport) -> str:
         f"scored {report.n_used}/{report.n_total} "
         f"({'reliable only' if report.reliable_only else 'all lengths'})",
         "",
-        f"bucket accuracy   {_fmt(m.bucket_accuracy)}",
-        f"adjacent (±1)     {_fmt(m.adjacent_accuracy)}",
+        f"bucket accuracy   {_fmt(m.bucket_accuracy)}{_ci_suffix(cis, 'bucket_accuracy')}",
+        f"  argmax variant  {_fmt(m.bucket_accuracy_argmax)}   [dim](mode of weighted softmax; comparable to the paper)[/dim]",
+        f"adjacent (±1)     {_fmt(m.adjacent_accuracy)}{_ci_suffix(cis, 'adjacent_accuracy')}",
         f"bucket MAE        {_fmt(m.bucket_mae)}",
-        f"spearman score    {_fmt(m.spearman_score)}   [dim](model_score vs cosine_score)[/dim]",
+        f"spearman score    {_fmt(m.spearman_score)}{_ci_suffix(cis, 'spearman_score')}   [dim](model_score vs cosine_score)[/dim]",
         f"spearman bucket   {_fmt(m.spearman_bucket)}",
+        f"auroc human|edited {_fmt(m.auroc_human)}{_ci_suffix(cis, 'auroc_human')}",
+        f"auroc edited|full  {_fmt(m.auroc_top)}{_ci_suffix(cis, 'auroc_top')}",
+        f"ece (argmax conf) {_fmt(m.ece_argmax)}",
         "",
         "[bold]confusion[/bold] [dim](rows=ground truth, cols=model)[/dim]",
     ]
     for i, row in enumerate(m.confusion):
         lines.append(f"  gt{i}  " + " ".join(f"{c:>5}" for c in row))
+    if m.calibration:
+        lines.append("")
+        lines.append(
+            "[bold]calibration[/bold] [dim](score quantile bins: mean score vs mean gt/(n-1))[/dim]"
+        )
+        for row in m.calibration:
+            lines.append(
+                f"  n={row['n']:<4} score={_fmt(row['mean_score'])}  gt={_fmt(row['mean_gt'])}"
+            )
     lines.append("")
     lines.append("[bold]model_score within each ground-truth bucket[/bold]")
     for b in sorted(m.per_gt_score):
         lines.append(f"  gt{b}  {_describe_line(m.per_gt_score[b])}")
+    if m.worst_disagreements:
+        lines.append("")
+        lines.append("[bold]worst disagreements[/bold]")
+        for w in m.worst_disagreements:
+            lines.append(
+                f"  gt{w['gt_bucket']}→{w['model_bucket']} "
+                f"score={_fmt(w['model_score'])}  [dim]{w['preview']}[/dim]"
+            )
     if m.source_control:
         lines.append("")
         lines.append(
@@ -794,9 +1121,26 @@ def format_dataset_report(report: DatasetReport) -> str:
         lines.append("  " + _describe_line(m.source_control["describe"]))
     lines.append("")
     lines.append("[bold]proposed bands[/bold] (model-score scale)")
-    for cut, name, pinned in report.bands.boundaries:
+    key_for = {0: "human", 1: "light", 3: "top"}
+    for i, (cut, name, pinned) in enumerate(report.bands.boundaries):
         tag = "pinned" if pinned else "interpolated"
-        lines.append(f"  < {_fmt(cut)}  {name:<18} [dim]({tag})[/dim]")
+        ci = report.bands.cut_cis.get(key_for.get(i, ""), None)
+        ci_txt = (
+            f" [{_fmt(ci[0])}, {_fmt(ci[1])}]" if ci and not np.isnan(ci[0]) else ""
+        )
+        lines.append(f"  < {_fmt(cut)}  {name:<18} [dim]({tag}{ci_txt})[/dim]")
+    if report.bands.degenerate:
+        lines.append(
+            "  [yellow]⚠ monotonicity clamp collapsed a band span; "
+            "treat this proposal as unusable[/yellow]"
+        )
+    if report.latency:
+        lines.append("")
+        lines.append(
+            f"[bold]latency[/bold]  p50={_fmt(report.latency['p50_s'])}s "
+            f"p95={_fmt(report.latency['p95_s'])}s · "
+            f"{_fmt(report.latency['words_per_s'], 0)} words/s"
+        )
     if report.quant_compare:
         qc = report.quant_compare
         lines.append("")
@@ -842,7 +1186,9 @@ def format_smoke_report(report: SmokeReport) -> str:
         f"[bold]smoke gradient[/bold]  {report.model} · {report.device}   {verdict}",
         "",
     ]
-    for label, score, band in zip(report.labels, report.scores, report.bands):
+    for label, score, band in zip(
+        report.labels, report.scores, report.bands, strict=True
+    ):
         lines.append(f"  {_fmt(score)}  {band:<18} {label}")
     lines.append("")
     lines.append(

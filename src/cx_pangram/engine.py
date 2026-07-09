@@ -113,7 +113,7 @@ def _qlora_n_buckets(checkpoint: str) -> int:
     raise ValueError(f"could not infer n_buckets from adapter at {checkpoint}")
 
 
-_BANDS = (
+BANDS = (
     (0.30, "human"),
     (0.55, "lightly edited"),
     (0.75, "moderately edited"),
@@ -122,7 +122,7 @@ _BANDS = (
 
 
 def band_for(score: float) -> str:
-    for hi, name in _BANDS:
+    for hi, name in BANDS:
         if score < hi:
             return name
     return "fully AI"
