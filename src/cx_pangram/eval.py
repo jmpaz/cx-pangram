@@ -642,7 +642,8 @@ def propose_bands(
     sweeps = _band_sweeps(scores, gts, n_buckets)
     defaults = {"human": BANDS[0][0], "light": BANDS[1][0], "top": BANDS[3][0]}
     cuts = {
-        k: (sweeps[k]["threshold"] if sweeps[k] else defaults[k]) for k in _SWEEP_KEYS
+        k: (sw["threshold"] if (sw := sweeps[k]) else defaults[k])
+        for k in _SWEEP_KEYS
     }
 
     t_h, t_l, t_top = cuts["human"], cuts["light"], cuts["top"]

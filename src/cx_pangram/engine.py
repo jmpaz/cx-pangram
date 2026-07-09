@@ -15,11 +15,16 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass
+from typing import cast
 
 import torch
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
+)
 
 from .preprocess import clean_text, count_words
 
@@ -64,7 +69,7 @@ def _bnb_usable(device: str) -> bool:
     if not device.startswith("cuda") or torch.version.hip is not None:
         return False
     try:
-        import bitsandbytes  # noqa: F401
+        import bitsandbytes  # noqa: F401  # ty: ignore[unresolved-import]
 
         return True
     except Exception:
@@ -176,7 +181,9 @@ class EditLens:
         self.checkpoint = checkpoint
         self.calibrated = self.model_name == "llama"
         self.quantized = False
-        self.tokenizer = AutoTokenizer.from_pretrained(base)
+        self.tokenizer = cast(
+            PreTrainedTokenizerBase, AutoTokenizer.from_pretrained(base)
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 

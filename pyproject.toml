@@ -47,6 +47,8 @@ eval = [
 dev = [
     "pytest>=8.0",
     "scipy>=1.11",
+    "ruff>=0.15",
+    "ty>=0.0.1a21",
 ]
 
 [project.urls]
