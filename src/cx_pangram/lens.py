@@ -47,13 +47,9 @@ def quiet() -> None:
 
 
 def _color(score: float) -> str:
-    if score < 0.35:
-        return "green"
-    if score < 0.55:
-        return "yellow"
-    if score < 0.75:
-        return "dark_orange"
-    return "red"
+    from .bands import band_for
+
+    return band_for(score).color
 
 
 _UNCOLORED_BANDS = frozenset({"human", "unreliable"})

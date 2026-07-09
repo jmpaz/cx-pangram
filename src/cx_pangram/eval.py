@@ -634,13 +634,13 @@ def propose_bands(
     reports when that clamp collapsed a band's span to zero. Each pinned cut
     carries a seeded bootstrap CI from re-running its sweep over resamples.
     """
-    from .engine import BANDS
+    from .bands import BANDS
 
     scores = np.array([s.model_score for s in scored], dtype=float)
     gts = np.array([s.gt_bucket for s in scored], dtype=int)
 
     sweeps = _band_sweeps(scores, gts, n_buckets)
-    defaults = {"human": BANDS[0][0], "light": BANDS[1][0], "top": BANDS[3][0]}
+    defaults = {"human": BANDS[0].hi, "light": BANDS[1].hi, "top": BANDS[3].hi}
     cuts = {
         k: (sw["threshold"] if (sw := sweeps[k]) else defaults[k]) for k in _SWEEP_KEYS
     }
@@ -652,7 +652,7 @@ def propose_bands(
     t_top = t_top_c
     t_m = (t_l + t_top) / 2.0
 
-    names = [name for _, name in BANDS]
+    names = [band.label for band in BANDS[:4]]
     ordered = [
         (t_h, names[0], sweeps["human"] is not None),
         (t_l, names[1], sweeps["light"] is not None),

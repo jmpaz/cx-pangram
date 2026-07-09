@@ -28,6 +28,8 @@ from transformers import (
 )
 
 from . import ModelAccessError
+from . import bands as _bands
+from .bands import Band
 from .preprocess import clean_text
 
 MODELS: dict[str, tuple[str, str]] = {
@@ -174,19 +176,10 @@ def _qlora_n_buckets(checkpoint: str) -> int:
     raise ValueError(f"could not infer n_buckets from adapter at {checkpoint}")
 
 
-BANDS = (
-    (0.30, "human"),
-    (0.55, "lightly edited"),
-    (0.75, "moderately edited"),
-    (0.90, "heavily edited"),
-)
-
-
 def band_for(score: float) -> str:
-    for hi, name in BANDS:
-        if score < hi:
-            return name
-    return "fully AI"
+    """Label under the default band table; the table itself lives in
+    :mod:`cx_pangram.bands`."""
+    return _bands.band_for(score).label
 
 
 @dataclass
@@ -224,11 +217,13 @@ class EditLens:
         device: str | None = None,
         base: str | None = None,
         quantize: bool | None = None,
+        bands: tuple[Band, ...] | None = None,
     ):
         self.device = select_device(device)
         if self.device.startswith("mps"):
             os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         self.quantize = quantize
+        self.bands = bands or _bands.BANDS
         self.model_name = model or default_model(self.device)
         if self.model_name in MODELS:
             checkpoint, default_base = MODELS[self.model_name]
@@ -392,7 +387,7 @@ class EditLens:
                 index=i,
                 score=round(s, 4),
                 bucket=int(b),
-                band=band_for(s),
+                band=_bands.band_for(s, self.bands).label,
                 n_words=len(w.split()),
                 probs=[round(x, 4) for x in p],
                 preview=w[:160],
@@ -407,7 +402,7 @@ class EditLens:
         reliable = n_words >= MIN_WORDS
         return Detection(
             score=round(agg, 4),
-            band=band_for(agg) if reliable else "unreliable",
+            band=_bands.band_for(agg, self.bands).label if reliable else "unreliable",
             bucket=round(agg * (self.n_buckets - 1)),
             n_words=n_words,
             n_chunks=len(chunks),

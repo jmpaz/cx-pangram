@@ -18,12 +18,15 @@ from cx_pangram.engine import (
 
 
 def _bare_engine(device="cpu", n_buckets=4):
+    from cx_pangram.bands import BANDS
+
     eng = object.__new__(EditLens)
     eng.device = device
     eng.model_name = "stub"
     eng.calibrated = False
     eng.n_buckets = n_buckets
     eng.max_length = 512
+    eng.bands = BANDS
     return eng
 
 
