@@ -6,6 +6,8 @@ readme = "README.md"
 authors = [
     { name = "jmpaz", email = "30947643+jmpaz@users.noreply.github.com" }
 ]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch>=2.4",
