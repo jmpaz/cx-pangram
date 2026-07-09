@@ -13,7 +13,9 @@ the per-chunk vector is retained for annotation.
 
 from __future__ import annotations
 
+import math
 import os
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import cast
@@ -189,6 +191,10 @@ class ChunkScore:
     bucket: int
     band: str
     n_words: int
+    word_start: int
+    word_end: int
+    confidence: float
+    truncated: bool
     probs: list[float]
     preview: str
 
@@ -201,6 +207,8 @@ class Detection:
     n_words: int
     n_chunks: int
     reliable: bool
+    confidence: float
+    truncated: bool
     model: str
     calibrated: bool
     most_ai_chunk: int | None
@@ -208,6 +216,43 @@ class Detection:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class _Window:
+    """One model-sized slice of a document's cleaned words.
+
+    ``word_start``/``word_end`` index into the *cleaned* word sequence — the
+    text the model actually saw. ``clean_text`` is lossy by design (lowercase,
+    demojize, whitespace collapse), so spans into the original string would
+    need a fuzzy re-aligner; cleaned-word coordinates are the honest contract.
+    """
+
+    text: str
+    n_words: int
+    word_start: int
+    word_end: int
+
+
+@dataclass
+class _Prepared:
+    n_words: int
+    windows: list[_Window]
+
+
+@dataclass
+class _WindowScore:
+    """One window's forward-pass outputs, before document assembly.
+
+    ``confidence`` is 1 − normalized entropy of the bucket distribution:
+    peakedness of what the model emitted, not a probability of correctness.
+    """
+
+    score: float
+    bucket: int
+    probs: list[float]
+    confidence: float
+    truncated: bool
 
 
 class EditLens:
@@ -256,6 +301,11 @@ class EditLens:
                 )
             self.net.to(self.device)
             self.max_length = MAX_LENGTH
+        # 350 words sits mid-distribution for EditLens training (75-799 words).
+        # Llama's 1024-token context could take ~600-word windows for ~2x long-doc
+        # throughput, but that trades unmeasured score fidelity at the training
+        # distribution's edge — benchmark before changing per model.
+        self.chunk_words = CHUNK_WORDS
 
         self.net.eval()
         self.device = str(next(self.net.parameters()).device)
@@ -299,34 +349,32 @@ class EditLens:
             net = net.to(device=self.device, dtype=head_dtype)
         return net
 
-    @torch.no_grad()
-    def _score(
-        self, texts: list[str]
-    ) -> tuple[list[float], list[int], list[list[float]]]:
-        scores: list[float] = []
-        buckets: list[int] = []
-        probs: list[list[float]] = []
+    @torch.inference_mode()
+    def _score(self, texts: list[str]) -> list[_WindowScore]:
+        out: list[_WindowScore] = []
         size = self._auto_batch(len(texts))
         start = 0
         while start < len(texts):
             batch = texts[start : start + size]
             try:
-                s, b, p = self._forward(batch)
+                scored = self._forward(batch)
             except RuntimeError as exc:
                 if size == 1 or not _is_oom(exc):
                     raise
                 _empty_cache(self.device)
                 size = max(1, size // 2)
                 continue
-            scores += s
-            buckets += b
-            probs += p
+            out += scored
             start += len(batch)
-        return scores, buckets, probs
+        return out
 
-    def _forward(
-        self, texts: list[str]
-    ) -> tuple[list[float], list[int], list[list[float]]]:
+    def _forward(self, texts: list[str]) -> list[_WindowScore]:
+        raw_lengths = [
+            len(ids)
+            for ids in self.tokenizer(texts, truncation=False, padding=False)[
+                "input_ids"
+            ]
+        ]
         enc = self.tokenizer(
             texts,
             truncation=True,
@@ -343,7 +391,25 @@ class EditLens:
         probs = torch.softmax(logits, dim=-1)
         labels = torch.arange(self.n_buckets, device=probs.device, dtype=probs.dtype)
         scores = (probs * labels).sum(-1) / (self.n_buckets - 1)
-        return scores.tolist(), probs.argmax(-1).tolist(), probs.tolist()
+        entropy = -(probs * probs.clamp_min(1e-9).log()).sum(-1)
+        confidence = 1.0 - entropy / math.log(self.n_buckets)
+        return [
+            _WindowScore(
+                score=s,
+                bucket=int(b),
+                probs=p,
+                confidence=c,
+                truncated=n > self.max_length,
+            )
+            for s, b, p, c, n in zip(
+                scores.tolist(),
+                probs.argmax(-1).tolist(),
+                probs.tolist(),
+                confidence.tolist(),
+                raw_lengths,
+                strict=True,
+            )
+        ]
 
     def _auto_batch(self, n_windows: int) -> int:
         """Up-front batch width: a slice of free VRAM on CUDA (backoff in _score
@@ -359,56 +425,88 @@ class EditLens:
         est = int(free * VRAM_BUDGET / per_window)
         return max(1, min(ceiling, est))
 
-    def detect(self, text: str) -> Detection:
-        cleaned = clean_text(text)
-        words = cleaned.split()
-        n_words = len(words)
-        if not words:
-            return Detection(
-                0.0,
-                "unreliable",
-                0,
-                0,
-                0,
-                False,
-                self.model_name,
-                self.calibrated,
-                None,
-                [],
-            )
-
+    def _prepare(self, text: str) -> _Prepared:
+        words = clean_text(text).split()
         windows = [
-            " ".join(words[i : i + CHUNK_WORDS])
-            for i in range(0, len(words), CHUNK_WORDS)
+            _Window(
+                text=" ".join(words[i : i + self.chunk_words]),
+                n_words=min(self.chunk_words, len(words) - i),
+                word_start=i,
+                word_end=min(i + self.chunk_words, len(words)),
+            )
+            for i in range(0, len(words), self.chunk_words)
         ]
-        scores, buckets, probs = self._score(windows)
+        return _Prepared(n_words=len(words), windows=windows)
+
+    def _assemble(self, prep: _Prepared, scored: list[_WindowScore]) -> Detection:
         chunks = [
             ChunkScore(
                 index=i,
-                score=round(s, 4),
-                bucket=int(b),
-                band=_bands.band_for(s, self.bands).label,
-                n_words=len(w.split()),
-                probs=[round(x, 4) for x in p],
-                preview=w[:160],
+                score=round(ws.score, 4),
+                bucket=ws.bucket,
+                band=_bands.band_for(ws.score, self.bands).label,
+                n_words=w.n_words,
+                word_start=w.word_start,
+                word_end=w.word_end,
+                confidence=round(ws.confidence, 4),
+                truncated=ws.truncated,
+                probs=[round(x, 4) for x in ws.probs],
+                preview=w.text[:160],
             )
-            for i, (w, s, b, p) in enumerate(
-                zip(windows, scores, buckets, probs, strict=True)
-            )
+            for i, (w, ws) in enumerate(zip(prep.windows, scored, strict=True))
         ]
+        reliable = prep.n_words >= MIN_WORDS
+        if not chunks:
+            return Detection(
+                score=0.0,
+                band="unreliable",
+                bucket=0,
+                n_words=0,
+                n_chunks=0,
+                reliable=False,
+                confidence=0.0,
+                truncated=False,
+                model=self.model_name,
+                calibrated=self.calibrated,
+                most_ai_chunk=None,
+                chunks=[],
+            )
         total = sum(c.n_words for c in chunks) or 1
         agg = sum(c.score * c.n_words for c in chunks) / total
+        conf = sum(c.confidence * c.n_words for c in chunks) / total
         most_ai = max(chunks, key=lambda c: c.score).index
-        reliable = n_words >= MIN_WORDS
         return Detection(
             score=round(agg, 4),
             band=_bands.band_for(agg, self.bands).label if reliable else "unreliable",
             bucket=round(agg * (self.n_buckets - 1)),
-            n_words=n_words,
+            n_words=prep.n_words,
             n_chunks=len(chunks),
             reliable=reliable,
+            confidence=round(conf, 4),
+            truncated=any(c.truncated for c in chunks),
             model=self.model_name,
             calibrated=self.calibrated,
             most_ai_chunk=most_ai,
             chunks=chunks,
         )
+
+    def detect_batch(self, texts: Sequence[str]) -> list[Detection]:
+        """Score many documents in one flat, VRAM-aware pass.
+
+        Windows from all documents are batched together, so many short
+        documents fill batches a per-document loop would leave mostly empty.
+        Windows stay contiguous per document; a cursor walk regroups them.
+        """
+        preps = [self._prepare(t) for t in texts]
+        flat = [w.text for p in preps for w in p.windows]
+        scored = self._score(flat) if flat else []
+        out: list[Detection] = []
+        cursor = 0
+        for prep in preps:
+            k = len(prep.windows)
+            out.append(self._assemble(prep, scored[cursor : cursor + k]))
+            cursor += k
+        return out
+
+    def detect(self, text: str) -> Detection:
+        return self.detect_batch([text])[0]

@@ -53,9 +53,12 @@ def test_is_oom_covers_cuda_and_mps():
 
 
 def test_empty_text_reads_unreliable():
+    from cx_pangram.engine import CHUNK_WORDS
+
     eng = object.__new__(EditLens)
     eng.model_name = "stub"
     eng.calibrated = False
+    eng.chunk_words = CHUNK_WORDS
     det = eng.detect("   \n\t  ")
     assert det.band == "unreliable"
     assert det.reliable is False

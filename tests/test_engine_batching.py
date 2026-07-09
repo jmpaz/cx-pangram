@@ -26,20 +26,28 @@ def _bare_engine(device="cpu", n_buckets=4):
     eng.calibrated = False
     eng.n_buckets = n_buckets
     eng.max_length = 512
+    eng.chunk_words = CHUNK_WORDS
     eng.bands = BANDS
     return eng
 
 
 def _linear_forward(record=None):
     """Deterministic per-text scores: length-derived, order-preserving."""
+    from cx_pangram.engine import _WindowScore
 
     def forward(texts):
         if record is not None:
             record.append(len(texts))
-        scores = [min(1.0, len(t) / 10000.0) for t in texts]
-        buckets = [round(s * 3) for s in scores]
-        probs = [[1.0 - s, 0.0, 0.0, s] for s in scores]
-        return scores, buckets, probs
+        return [
+            _WindowScore(
+                score=(s := min(1.0, len(t) / 10000.0)),
+                bucket=round(s * 3),
+                probs=[1.0 - s, 0.0, 0.0, s],
+                confidence=0.9,
+                truncated=False,
+            )
+            for t in texts
+        ]
 
     return forward
 
@@ -49,9 +57,9 @@ def test_score_preserves_order_across_batches(monkeypatch):
     widths = []
     monkeypatch.setattr(eng, "_forward", _linear_forward(widths), raising=False)
     texts = [f"{'x' * (i + 1)}" for i in range(20)]
-    scores, buckets, probs = eng._score(texts)
-    assert len(scores) == len(buckets) == len(probs) == 20
-    assert scores == sorted(scores)
+    scored = eng._score(texts)
+    assert len(scored) == 20
+    assert [w.score for w in scored] == sorted(w.score for w in scored)
     assert all(w <= DEFAULT_BATCH for w in widths)
     assert sum(w for w in widths) == 20
 
@@ -69,9 +77,9 @@ def test_oom_backoff_halves_and_recovers(monkeypatch):
 
     monkeypatch.setattr(eng, "_forward", flaky, raising=False)
     texts = [f"{'x' * (i + 1)}" for i in range(8)]
-    scores, _, _ = eng._score(texts)
-    assert len(scores) == 8
-    assert scores == sorted(scores)
+    scored = eng._score(texts)
+    assert len(scored) == 8
+    assert [w.score for w in scored] == sorted(w.score for w in scored)
     assert max(widths) > 2
     assert all(w <= 2 for w in widths[widths.index(max(widths)) + 2 :])
 
@@ -146,3 +154,48 @@ def test_detect_result_invariant_to_batch_width(monkeypatch):
     four = run(4)
     assert [c.score for c in one.chunks] == [c.score for c in four.chunks]
     assert one.score == four.score
+
+
+def test_detect_batch_flattens_windows_across_docs(monkeypatch):
+    eng = _bare_engine()
+    widths = []
+    monkeypatch.setattr(eng, "_forward", _linear_forward(widths), raising=False)
+    docs = [
+        " ".join(["a"] * (CHUNK_WORDS + 10)),
+        " ".join(["b"] * 30),
+        " ".join(["c"] * (CHUNK_WORDS * 2 + 5)),
+    ]
+    dets = eng.detect_batch(docs)
+    assert [d.n_chunks for d in dets] == [2, 1, 3]
+    assert sum(w for w in widths) == 6
+    singles = [eng.detect(doc) for doc in docs]
+    assert [d.score for d in dets] == [d.score for d in singles]
+    assert [c.word_start for c in dets[2].chunks] == [0, CHUNK_WORDS, CHUNK_WORDS * 2]
+
+
+def test_detect_batch_empty_docs_yield_unreliable(monkeypatch):
+    eng = _bare_engine()
+    monkeypatch.setattr(eng, "_forward", _linear_forward(), raising=False)
+    dets = eng.detect_batch(["", " ".join(["x"] * 60), "   "])
+    assert [d.band == "unreliable" for d in dets] == [True, False, True]
+    assert dets[1].reliable
+
+
+def test_detect_exposes_confidence_and_truncation(monkeypatch):
+    from cx_pangram.engine import _WindowScore
+
+    eng = _bare_engine()
+
+    def forward(texts):
+        return [
+            _WindowScore(
+                score=0.5, bucket=2, probs=[0.25] * 4, confidence=0.0, truncated=True
+            )
+            for _ in texts
+        ]
+
+    monkeypatch.setattr(eng, "_forward", forward, raising=False)
+    det = eng.detect(" ".join(["y"] * 60))
+    assert det.truncated is True
+    assert det.confidence == pytest.approx(0.0)
+    assert det.chunks[0].truncated is True
