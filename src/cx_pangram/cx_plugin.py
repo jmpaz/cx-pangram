@@ -41,12 +41,16 @@ def register_command(root: click.Group) -> None:
         device: str | None,
     ) -> None:
         """Score refs' authored prose for AI-edit extent with a local EditLens."""
+        from . import ModelAccessError
         from . import lens as lens_core
 
         lens_core.quiet()
-        results = lens_core.score_refs(
-            targets, model=model, base=base, device=device, split=split
-        )
+        try:
+            results = lens_core.score_refs(
+                targets, model=model, base=base, device=device, split=split
+            )
+        except ModelAccessError as exc:
+            raise click.ClickException(str(exc)) from exc
 
         if jsonl:
             click.echo(lens_core.format_jsonl(results))

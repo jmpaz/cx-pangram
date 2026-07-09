@@ -8,13 +8,27 @@ without contextualize installed.
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 
 import click
 import typer
 from rich.console import Console
 from typer.core import TyperGroup
 
+from . import ModelAccessError
+
 console = Console(highlight=False)
+err_console = Console(highlight=False, stderr=True)
+
+
+@contextmanager
+def _model_access_guard():
+    """Render gated/missing-repo failures as guidance instead of a traceback."""
+    try:
+        yield
+    except ModelAccessError as exc:
+        err_console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(1) from exc
 
 
 class DefaultCommandGroup(TyperGroup):
@@ -93,9 +107,10 @@ def score(
         raw = sys.stdin.read()
 
     if raw is not None:
-        results = lens_core.score_text(
-            raw, model=model, base=base, device=device, quantize=quantize
-        )
+        with _model_access_guard():
+            results = lens_core.score_text(
+                raw, model=model, base=base, device=device, quantize=quantize
+            )
         if jsonl:
             typer.echo(lens_core.format_jsonl(results))
             raise typer.Exit()
@@ -110,14 +125,15 @@ def score(
         raise typer.Exit()
 
     try:
-        results = lens_core.score_refs(
-            targets,
-            model=model,
-            base=base,
-            device=device,
-            split=split,
-            quantize=quantize,
-        )
+        with _model_access_guard():
+            results = lens_core.score_refs(
+                targets,
+                model=model,
+                base=base,
+                device=device,
+                split=split,
+                quantize=quantize,
+            )
     except ModuleNotFoundError as exc:
         if exc.name and exc.name.split(".")[0] == "contextualize":
             raise typer.BadParameter(
@@ -209,37 +225,38 @@ def eval_cmd(
         raise typer.Exit()
 
     if smoke:
-        _emit(
-            ev.smoke_gradient(model=model, base=base, device=device, quantize=quantize),
-            ev.format_smoke_report,
-        )
+        with _model_access_guard():
+            report = ev.smoke_gradient(
+                model=model, base=base, device=device, quantize=quantize
+            )
+        _emit(report, ev.format_smoke_report)
 
     if targets:
-        _emit(
-            ev.eval_refs(
+        with _model_access_guard():
+            report = ev.eval_refs(
                 targets,
                 model=model,
                 base=base,
                 device=device,
                 quantize=quantize,
                 reliable_only=reliable_only,
-            ),
-            ev.format_refs_report,
-        )
+            )
+        _emit(report, ev.format_refs_report)
 
     compare = "quant" if compare_quant else "models" if compare_models else None
-    report = ev.eval_dataset(
-        n=samples,
-        split=split,
-        seed=seed,
-        model=model,
-        base=base,
-        device=device,
-        quantize=quantize,
-        reliable_only=reliable_only,
-        compare=compare,
-        with_source=with_source,
-    )
+    with _model_access_guard():
+        report = ev.eval_dataset(
+            n=samples,
+            split=split,
+            seed=seed,
+            model=model,
+            base=base,
+            device=device,
+            quantize=quantize,
+            reliable_only=reliable_only,
+            compare=compare,
+            with_source=with_source,
+        )
     if write_bands:
         import json
         from pathlib import Path

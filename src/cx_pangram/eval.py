@@ -117,7 +117,7 @@ def load_samples(
             "the eval dataset path needs `datasets`; install cx-pangram[eval]"
         ) from exc
 
-    from .preprocess import clean_text, count_words
+    from .preprocess import clean_text
 
     try:
         ds = load_dataset(DATASET_ID, split=split, streaming=True)
@@ -131,7 +131,7 @@ def load_samples(
     samples: list[Sample] = []
     for row in ds:
         cosine = float(row["cosine_score"])
-        n_words = count_words(clean_text(row["text"]))
+        n_words = len(clean_text(row["text"]).split())
         samples.append(
             Sample(
                 text=row["text"],
@@ -642,8 +642,7 @@ def propose_bands(
     sweeps = _band_sweeps(scores, gts, n_buckets)
     defaults = {"human": BANDS[0][0], "light": BANDS[1][0], "top": BANDS[3][0]}
     cuts = {
-        k: (sw["threshold"] if (sw := sweeps[k]) else defaults[k])
-        for k in _SWEEP_KEYS
+        k: (sw["threshold"] if (sw := sweeps[k]) else defaults[k]) for k in _SWEEP_KEYS
     }
 
     t_h, t_l, t_top = cuts["human"], cuts["light"], cuts["top"]

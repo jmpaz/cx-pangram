@@ -14,6 +14,7 @@ the per-chunk vector is retained for annotation.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import cast
 
@@ -26,7 +27,8 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from .preprocess import clean_text, count_words
+from . import ModelAccessError
+from .preprocess import clean_text
 
 MODELS: dict[str, tuple[str, str]] = {
     "roberta": ("pangram/editlens_roberta-large", "FacebookAI/roberta-large"),
@@ -76,6 +78,21 @@ def _bnb_usable(device: str) -> bool:
         return False
 
 
+def _is_oom(exc: RuntimeError) -> bool:
+    """CUDA raises a dedicated type; MPS and CPU raise plain RuntimeErrors whose
+    message is the only signal."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _empty_cache(device: str) -> None:
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    elif device.startswith("mps"):
+        torch.mps.empty_cache()
+
+
 def _resolve_quantize(device: str, want: bool | None) -> bool:
     if want is None:
         return _bnb_usable(device)
@@ -101,16 +118,55 @@ class NormedLinear(torch.nn.Module):
         return self.linear(self.norm(x))
 
 
-def _is_qlora(checkpoint: str) -> bool:
+@contextmanager
+def _hf_access(repo: str):
+    """Translate huggingface_hub access failures into actionable ModelAccessErrors.
+
+    Exception order matters: GatedRepoError subclasses RepositoryNotFoundError,
+    and LocalEntryNotFoundError subclasses EntryNotFoundError.
+    """
+    from huggingface_hub.errors import (
+        GatedRepoError,
+        LocalEntryNotFoundError,
+        RepositoryNotFoundError,
+    )
+
     try:
-        hf_hub_download(checkpoint, "adapter_config.json")
-        return True
-    except Exception:
-        return False
+        yield
+    except GatedRepoError as exc:
+        raise ModelAccessError(
+            f"{repo} is gated on Hugging Face; set HF_TOKEN to a token with "
+            f"granted access (request it at https://huggingface.co/{repo}, "
+            f"or run `hf auth login`)"
+        ) from exc
+    except RepositoryNotFoundError as exc:
+        raise ModelAccessError(
+            f"model repo {repo!r} not found — check the name, or set HF_TOKEN "
+            f"if it is private"
+        ) from exc
+    except LocalEntryNotFoundError as exc:
+        raise ModelAccessError(
+            f"{repo} is not cached locally and the network is unreachable; "
+            f"connect once to download it"
+        ) from exc
+
+
+def _is_qlora(checkpoint: str) -> bool:
+    from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
+
+    with _hf_access(checkpoint):
+        try:
+            hf_hub_download(checkpoint, "adapter_config.json")
+            return True
+        except LocalEntryNotFoundError:
+            raise
+        except EntryNotFoundError:
+            return False
 
 
 def _qlora_n_buckets(checkpoint: str) -> int:
-    path = hf_hub_download(checkpoint, "adapter_model.safetensors")
+    with _hf_access(checkpoint):
+        path = hf_hub_download(checkpoint, "adapter_model.safetensors")
     with safe_open(path, framework="pt") as f:
         for key in f.keys():  # noqa: SIM118 — safe_open handle is not a dict
             if "score" in key and "linear.weight" in key:
@@ -174,16 +230,23 @@ class EditLens:
             os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         self.quantize = quantize
         self.model_name = model or default_model(self.device)
-        checkpoint, default_base = MODELS.get(
-            self.model_name, (self.model_name, MODELS["roberta"][1])
-        )
+        if self.model_name in MODELS:
+            checkpoint, default_base = MODELS[self.model_name]
+        elif base:
+            checkpoint, default_base = self.model_name, base
+        else:
+            raise ValueError(
+                f"unknown model {self.model_name!r}; expected one of "
+                f"{sorted(MODELS)}, or pass base= for a custom checkpoint"
+            )
         base = base or default_base
         self.checkpoint = checkpoint
         self.calibrated = self.model_name == "llama"
         self.quantized = False
-        self.tokenizer = cast(
-            PreTrainedTokenizerBase, AutoTokenizer.from_pretrained(base)
-        )
+        with _hf_access(base):
+            self.tokenizer = cast(
+                PreTrainedTokenizerBase, AutoTokenizer.from_pretrained(base)
+            )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -192,9 +255,10 @@ class EditLens:
             self.tokenizer.padding_side = "left"
             self.max_length = LLAMA_MAX_LENGTH
         else:
-            self.net = AutoModelForSequenceClassification.from_pretrained(
-                checkpoint, dtype=_unquantized_dtype(self.device)
-            )
+            with _hf_access(checkpoint):
+                self.net = AutoModelForSequenceClassification.from_pretrained(
+                    checkpoint, dtype=_unquantized_dtype(self.device)
+                )
             self.net.to(self.device)
             self.max_length = MAX_LENGTH
 
@@ -224,9 +288,10 @@ class EditLens:
             head_dtype = _unquantized_dtype(self.device)
             load_kwargs["dtype"] = head_dtype
 
-        base_model = AutoModelForSequenceClassification.from_pretrained(
-            base, **load_kwargs
-        )
+        with _hf_access(base):
+            base_model = AutoModelForSequenceClassification.from_pretrained(
+                base, **load_kwargs
+            )
         base_model.config.pad_token_id = self.tokenizer.pad_token_id
         if isinstance(getattr(base_model, "score", None), torch.nn.Linear):
             hidden = base_model.config.hidden_size
@@ -252,10 +317,10 @@ class EditLens:
             batch = texts[start : start + size]
             try:
                 s, b, p = self._forward(batch)
-            except torch.cuda.OutOfMemoryError:
-                if size == 1:
+            except RuntimeError as exc:
+                if size == 1 or not _is_oom(exc):
                     raise
-                torch.cuda.empty_cache()
+                _empty_cache(self.device)
                 size = max(1, size // 2)
                 continue
             scores += s
@@ -302,11 +367,11 @@ class EditLens:
     def detect(self, text: str) -> Detection:
         cleaned = clean_text(text)
         words = cleaned.split()
-        n_words = count_words(cleaned)
+        n_words = len(words)
         if not words:
             return Detection(
                 0.0,
-                band_for(0.0),
+                "unreliable",
                 0,
                 0,
                 0,
